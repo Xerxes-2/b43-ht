@@ -1,0 +1,3295 @@
+diff --git a/drivers/net/wireless/broadcom/b43/b43.h b/drivers/net/wireless/broadcom/b43/b43.h
+--- a/drivers/net/wireless/broadcom/b43/b43.h
++++ b/drivers/net/wireless/broadcom/b43/b43.h
+@@ -937,6 +937,24 @@
+ 
+ 	bool radiotap_enabled;
+ 	bool radio_enabled;
++	/* mac80211 software scan in progress */
++	bool scanning;
++	/* Slot time (us) last set from BSS info, 0 if never */
++	u8 slot_time;
++	/* TX A-MPDU to our (single) peer: reorder window per TID (0 = no
++	 * session), its max A-MPDU length and MPDU start spacing (IEEE
++	 * encoding)
++	 */
++	u8 ampdu_buf[IEEE80211_NUM_TIDS];
++	unsigned int ampdu_max_len;
++	u8 ampdu_density;
++	/* Sequence numbers of the first MPDU of each A-MPDU in flight, per
++	 * TID: the oldest bounds what the next one may contain
++	 */
++	u16 ampdu_ssn[IEEE80211_NUM_TIDS][4];
++	u8 ampdu_nssn[IEEE80211_NUM_TIDS];
++	/* Last BAR start sequence sent per TID, 0x8000 set when valid */
++	u16 ampdu_bar_ssn[IEEE80211_NUM_TIDS];
+ 
+ 	/* The beacon we are currently using (AP or IBSS mode). */
+ 	struct sk_buff *current_beacon;
+diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broadcom/b43/dma.c
+--- a/drivers/net/wireless/broadcom/b43/dma.c
++++ b/drivers/net/wireless/broadcom/b43/dma.c
+@@ -1186,8 +1186,16 @@
+ 	return ring;
+ }
+ 
++struct b43_ampdu_txinfo {
++	enum b43_ampdu_pos pos;
++	bool first;
++	u8 ndelim;
++	unsigned int total;
++};
++
+ static int dma_tx_fragment(struct b43_dmaring *ring,
+-			   struct sk_buff *skb)
++			   struct sk_buff *skb,
++			   const struct b43_ampdu_txinfo *ampdu, bool poke)
+ {
+ 	const struct b43_dma_ops *ops = ring->ops;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+@@ -1223,6 +1231,9 @@
+ 		ring->used_slots = old_used_slots;
+ 		return err;
+ 	}
++	if (ampdu)
++		b43_txhdr_ampdu(header, ampdu->pos, ampdu->first,
++				ampdu->total, ampdu->ndelim);
+ 
+ 	meta_hdr->dmaaddr = map_descbuffer(ring, (unsigned char *)header,
+ 					   hdrsize, 1);
+@@ -1241,6 +1252,8 @@
+ 
+ 	meta->skb = skb;
+ 	meta->is_last_fragment = true;
++	meta->ampdu = ampdu ? ampdu->pos : B43_AMPDU_NONE;
++	meta->vif = info->control.vif;
+ 	priv_info->bouncebuffer = NULL;
+ 
+ 	meta->dmaaddr = map_descbuffer(ring, skb->data, skb->len, 1);
+@@ -1274,9 +1287,12 @@
+ 		b43_shm_write16(ring->dev, B43_SHM_SHARED,
+ 				B43_SHM_SH_MCASTCOOKIE, cookie);
+ 	}
+-	/* Now transfer the whole frame. */
++	/* Now transfer the whole frame (A-MPDU: once all are queued, the
++	 * ucode must not start on a partial one).
++	 */
+ 	wmb();
+-	ops->poke_tx(ring, next_slot(ring, slot));
++	if (poke)
++		ops->poke_tx(ring, next_slot(ring, slot));
+ 	return 0;
+ 
+ out_unmap_hdr:
+@@ -1383,7 +1399,7 @@
+ 	 * static, so we don't need to store it per frame. */
+ 	ring->queue_prio = skb_get_queue_mapping(skb);
+ 
+-	err = dma_tx_fragment(ring, skb);
++	err = dma_tx_fragment(ring, skb, NULL, true);
+ 	if (unlikely(err == -ENOKEY)) {
+ 		/* Drop this packet, as we don't have the encryption key
+ 		 * anymore and must not transmit it unencrypted. */
+@@ -1411,6 +1427,249 @@
+ 	return err;
+ }
+ 
++/* How many more frames the ring for this skb's queue takes */
++int b43_dma_tx_free_frames(struct b43_wldev *dev, struct sk_buff *skb)
++{
++	struct b43_dmaring *ring =
++		select_ring_by_priority(dev, skb_get_queue_mapping(skb));
++
++	if (ring->stopped)
++		return 0;
++	return free_slots(ring) / TX_SLOTS_PER_FRAME;
++}
++
++/* Frames for an A-MPDU wait in the software queue while the ring already
++ * has enough aggregates queued: otherwise each one goes out on its own.
++ */
++#define B43_AMPDU_INFLIGHT	2
++
++bool b43_dma_ampdu_busy(struct b43_wldev *dev, struct sk_buff *skb)
++{
++	return select_ring_by_priority(dev, skb_get_queue_mapping(skb))->
++		ampdu_inflight >= B43_AMPDU_INFLIGHT;
++}
++
++/* Queue the MPDUs of one A-MPDU (all to the same TID and peer, at the same
++ * rate) back to back, and start DMA once. Takes all skbs from @list
++ * unless it fails before queueing the first one.
++ */
++int b43_dma_tx_ampdu(struct b43_wldev *dev, struct sk_buff_head *list,
++		     const u8 *ndelim, unsigned int total)
++{
++	struct sk_buff *skb = skb_peek(list);
++	unsigned int n = skb_queue_len(list), i;
++	unsigned int queue = skb_get_queue_mapping(skb);
++	struct b43_dmaring *ring = select_ring_by_priority(dev, queue);
++	struct b43_ampdu_txinfo ampdu = { .total = total };
++	int err = 0;
++
++	if (ring->stopped || free_slots(ring) < n * TX_SLOTS_PER_FRAME)
++		return -ENOSPC;
++	ring->queue_prio = queue;
++
++	for (i = 0; i < n; i++) {
++		skb = __skb_dequeue(list);
++		ampdu.first = i == 0;
++		ampdu.pos = i == n - 1 ? B43_AMPDU_LAST :
++			    i == 0 ? B43_AMPDU_FIRST : B43_AMPDU_INTER;
++		ampdu.ndelim = ndelim[i];
++		err = dma_tx_fragment(ring, skb, &ampdu, i == n - 1);
++		if (unlikely(err)) {
++			if (i == 0) {
++				__skb_queue_head(list, skb);
++				return err;
++			}
++			/* Can't take back what is queued: send it as is */
++			b43err(dev->wl, "A-MPDU: TX mapping failure\n");
++			ieee80211_free_txskb(dev->wl->hw, skb);
++			while ((skb = __skb_dequeue(list)))
++				ieee80211_free_txskb(dev->wl->hw, skb);
++			wmb();
++			ring->ops->poke_tx(ring, next_slot(ring, ring->current_slot));
++			break;
++		}
++	}
++
++	ring->ampdu_inflight++;
++	if (free_slots(ring) < TX_SLOTS_PER_FRAME) {
++		b43_stop_queue(dev, queue);
++		dev->wl->tx_queue_stopped[queue] = true;
++		ring->stopped = true;
++	}
++	return 0;
++}
++
++/* Report one MPDU of an A-MPDU to mac80211, which takes the status of
++ * each as one attempt of an aggregate.
++ */
++static void dma_ampdu_report(struct b43_wldev *dev, struct sk_buff *skb,
++			     bool acked)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	u8 tries = info->control.rates[3].count + 1;
++
++	ieee80211_tx_info_clear_status(info);
++	info->status.rates[0].count = tries;
++	info->status.rates[1].idx = -1;
++	info->flags |= IEEE80211_TX_STAT_AMPDU;
++	info->status.ampdu_len = 1;
++	info->status.ampdu_ack_len = acked;
++	if (acked)
++		info->flags |= IEEE80211_TX_STAT_ACK;
++	/* No IEEE80211_TX_STAT_AMPDU_NO_BACK: mac80211 would send one BAR per
++	 * MPDU given up, see dma_ampdu_send_bar()
++	 */
++	ieee80211_tx_status_skb(dev->wl->hw, skb);
++}
++
++/* Each MPDU gets this many more tries in later A-MPDUs (the ucode sends an
++ * A-MPDU once; brcmsmac retries in the driver too, up to 5). With 2, on a
++ * busy 2.4 GHz channel ~3% of the MPDUs were given up, which TCP feels.
++ */
++#define B43_AMPDU_RETRIES	4
++
++/* seq a is before b, modulo 4096 */
++static bool b43_seq_before(u16 a, u16 b)
++{
++	return a != b && ((b - a) & 0xFFF) < 0x800;
++}
++
++/* MPDUs up to @gaveup were given up: move the recipient's window past them
++ * with one BAR. mac80211 sends a BAR for every MPDU flagged NO_BACK; after
++ * a bad A-MPDU those queue up behind each other, each takes a channel
++ * access, and the BAR/BA ping-pong starved the data (measured: 2500 BARs
++ * in 3 s). The window may only move as far as the oldest MPDU still to be
++ * retried or in flight, or the recipient drops it as old.
++ */
++static void dma_ampdu_send_bar(struct b43_wldev *dev, struct ieee80211_vif *vif,
++			       u8 *ra, u8 tid, u16 gaveup,
++			       struct sk_buff_head *retry)
++{
++	struct b43_wl *wl = dev->wl;
++	u16 ssn = (gaveup + 1) & 0xFFF;
++	struct sk_buff *skb;
++	int i;
++
++	skb_queue_walk(retry, skb) {
++		struct ieee80211_hdr *h = (struct ieee80211_hdr *)skb->data;
++		u16 s = le16_to_cpu(h->seq_ctrl) >> 4;
++
++		if (ieee80211_get_tid(h) == tid && b43_seq_before(s, ssn))
++			ssn = s;
++	}
++	for (i = 0; i < wl->ampdu_nssn[tid]; i++)
++		if (b43_seq_before(wl->ampdu_ssn[tid][i], ssn))
++			ssn = wl->ampdu_ssn[tid][i];
++	if ((wl->ampdu_bar_ssn[tid] & 0x8000) &&
++	    !b43_seq_before(wl->ampdu_bar_ssn[tid] & 0xFFF, ssn))
++		return;
++	wl->ampdu_bar_ssn[tid] = ssn | 0x8000;
++	ieee80211_send_bar(vif, ra, tid, ssn << 4);
++}
++
++static void dma_handle_ampdu_txstatus(struct b43_wldev *dev,
++				      struct b43_dmaring *ring, int slot,
++				      const struct b43_txstatus *status)
++{
++	const struct b43_dma_ops *ops = ring->ops;
++	struct b43_dmadesc_meta *meta;
++	struct sk_buff_head retry;
++	struct sk_buff_head *q;
++	unsigned long flags;
++	bool first = true;
++	struct ieee80211_vif *vif = NULL;
++	u8 ra[ETH_ALEN], tid = 0;
++	int gaveup = -1;
++
++	__skb_queue_head_init(&retry);
++	if (ring->ampdu_inflight > 0)
++		ring->ampdu_inflight--;
++	while (1) {
++		struct ieee80211_tx_info *info;
++		struct ieee80211_hdr *hdr;
++		struct sk_buff *skb;
++		bool acked = false;
++		u8 pos;
++
++		/* Header */
++		ops->idx2desc(ring, slot, &meta);
++		if (unlikely(meta->skb)) {
++			b43dbg(dev->wl, "A-MPDU status: unexpected skb at slot %d on ring %d\n",
++			       slot, ring->index);
++			break;
++		}
++		unmap_descbuffer(ring, meta->dmaaddr, b43_txhdr_size(dev), 1);
++		ring->used_slots--;
++
++		/* Payload */
++		slot = next_slot(ring, slot);
++		ops->idx2desc(ring, slot, &meta);
++		skb = meta->skb;
++		if (unlikely(!skb || b43_dma_ptr_is_poisoned(skb))) {
++			b43dbg(dev->wl, "A-MPDU status: no skb at slot %d on ring %d\n",
++			       slot, ring->index);
++			break;
++		}
++		info = IEEE80211_SKB_CB(skb);
++		unmap_descbuffer(ring, meta->dmaaddr, skb->len, 1);
++		kfree(b43_get_priv_tx_info(info)->bouncebuffer);
++		b43_get_priv_tx_info(info)->bouncebuffer = NULL;
++		info->control.vif = meta->vif;
++		pos = meta->ampdu;
++		meta->skb = B43_DMA_PTR_POISON;
++		ring->used_slots--;
++
++		hdr = (struct ieee80211_hdr *)skb->data;
++		if (first) {
++			struct b43_wl *wl = dev->wl;
++			u8 tid = ieee80211_get_tid(hdr);
++			u16 seq = le16_to_cpu(hdr->seq_ctrl) >> 4;
++			int i;
++
++			for (i = 0; i < wl->ampdu_nssn[tid]; i++) {
++				if (wl->ampdu_ssn[tid][i] != seq)
++					continue;
++				wl->ampdu_ssn[tid][i] =
++					wl->ampdu_ssn[tid][--wl->ampdu_nssn[tid]];
++				break;
++			}
++			first = false;
++		}
++		if (status->ba) {
++			u16 idx = ((le16_to_cpu(hdr->seq_ctrl) >> 4) -
++				   status->ba_start) & 0xFFF;
++
++			acked = idx < 64 &&
++				(status->ba_bitmap[idx / 8] & BIT(idx % 8));
++		}
++		if (!acked && info->control.rates[3].count < B43_AMPDU_RETRIES) {
++			info->control.rates[3].count++;
++			__skb_queue_tail(&retry, skb);
++		} else {
++			if (!acked && ieee80211_is_data_qos(hdr->frame_control)) {
++				gaveup = le16_to_cpu(hdr->seq_ctrl) >> 4;
++				tid = ieee80211_get_tid(hdr);
++				ether_addr_copy(ra, hdr->addr1);
++				vif = info->control.vif;
++			}
++			dma_ampdu_report(dev, skb, acked);
++		}
++
++		if (pos != B43_AMPDU_FIRST && pos != B43_AMPDU_INTER)
++			break;
++		slot = next_slot(ring, slot);
++	}
++
++	if (gaveup >= 0 && vif)
++		dma_ampdu_send_bar(dev, vif, ra, tid, gaveup, &retry);
++
++	/* Retransmit before anything newer of this queue */
++	q = &dev->wl->tx_queue[ring->queue_prio];
++	spin_lock_irqsave(&q->lock, flags);
++	skb_queue_splice(&retry, q);
++	spin_unlock_irqrestore(&q->lock, flags);
++}
++
+ void b43_dma_handle_txstatus(struct b43_wldev *dev,
+ 			     const struct b43_txstatus *status)
+ {
+@@ -1470,6 +1729,11 @@
+ 	}
+ 
+ 	ops = ring->ops;
++	if (status->for_ampdu) {
++		if (likely(!skip))
++			dma_handle_ampdu_txstatus(dev, ring, slot, status);
++		goto out_wake;
++	}
+ 	while (1) {
+ 		B43_WARN_ON(slot < 0 || slot >= ring->nr_slots);
+ 		/* get meta - ignore returned value */
+@@ -1560,6 +1824,7 @@
+ 		if (skip > 0)
+ 			--skip;
+ 	}
++out_wake:
+ 	if (ring->stopped) {
+ 		B43_WARN_ON(free_slots(ring) < TX_SLOTS_PER_FRAME);
+ 		ring->stopped = false;
+diff --git a/drivers/net/wireless/broadcom/b43/dma.h b/drivers/net/wireless/broadcom/b43/dma.h
+--- a/drivers/net/wireless/broadcom/b43/dma.h
++++ b/drivers/net/wireless/broadcom/b43/dma.h
+@@ -190,6 +190,12 @@
+ 	dma_addr_t dmaaddr;
+ 	/* ieee80211 TX status. Only used once per 802.11 frag. */
+ 	bool is_last_fragment;
++	/* TX: position in an A-MPDU (enum b43_ampdu_pos), and the vif the
++	 * frame was queued for (b43_private_tx_info overwrites it in the
++	 * skb's control info; needed again if we retransmit it)
++	 */
++	u8 ampdu;
++	struct ieee80211_vif *vif;
+ };
+ 
+ struct b43_dmaring;
+@@ -257,6 +263,8 @@
+ 	enum b43_dmatype type;
+ 	/* Boolean. Is this ring stopped at ieee80211 level? */
+ 	bool stopped;
++	/* A-MPDUs queued and not yet reported */
++	int ampdu_inflight;
+ 	/* The QOS priority assigned to this ring. Only used for TX rings.
+ 	 * This is the mac80211 "queue" value. */
+ 	u8 queue_prio;
+@@ -293,6 +301,10 @@
+ 
+ int b43_dma_tx(struct b43_wldev *dev,
+ 	       struct sk_buff *skb);
++int b43_dma_tx_free_frames(struct b43_wldev *dev, struct sk_buff *skb);
++bool b43_dma_ampdu_busy(struct b43_wldev *dev, struct sk_buff *skb);
++int b43_dma_tx_ampdu(struct b43_wldev *dev, struct sk_buff_head *list,
++		     const u8 *ndelim, unsigned int total);
+ void b43_dma_handle_txstatus(struct b43_wldev *dev,
+ 			     const struct b43_txstatus *status);
+ 
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -38,6 +38,7 @@
+ #include "phy_common.h"
+ #include "phy_g.h"
+ #include "phy_n.h"
++#include "phy_ht.h"
+ #include "dma.h"
+ #include "pio.h"
+ #include "sysfs.h"
+@@ -85,6 +86,22 @@
+ module_param_named(hwpctl, modparam_hwpctl, int, 0444);
+ MODULE_PARM_DESC(hwpctl, "Enable hardware-side power control (default off)");
+ 
++int b43_modparam_txant = -1;
++module_param_named(txant, b43_modparam_txant, int, 0644);
++MODULE_PARM_DESC(txant, "EXPERIMENTAL: override TX header antenna bits (mask 0x3c0), -1 = driver default");
++
++static int modparam_qos4331;
++module_param_named(qos4331, modparam_qos4331, int, 0444);
++MODULE_PARM_DESC(qos4331, "EXPERIMENTAL: allow QoS (EDCF) on BCM4331 despite the quirk");
++
++static int modparam_htphy_11n;
++module_param_named(htphy_11n, modparam_htphy_11n, int, 0444);
++MODULE_PARM_DESC(htphy_11n, "EXPERIMENTAL 802.11n on HT-PHY (BCM4331): 1=HT rates at 20 MHz and RX A-MPDU, 2=also TX A-MPDU, 3=also 40 MHz (5 GHz only); implies qos4331");
++
++static int modparam_htphy_5ghz;
++module_param_named(htphy_5ghz, modparam_htphy_5ghz, int, 0444);
++MODULE_PARM_DESC(htphy_5ghz, "EXPERIMENTAL 5 GHz on HT-PHY (BCM4331): 0=off, 1=receive only (no TX), 2=full");
++
+ static int modparam_nohwcrypt;
+ module_param_named(nohwcrypt, modparam_nohwcrypt, int, 0444);
+ MODULE_PARM_DESC(nohwcrypt, "Disable hardware encryption.");
+@@ -317,6 +334,18 @@
+ 	CHAN5G(216, 0),
+ };
+ #undef CHAN4G
++/* Only the channels that have an entry in the radio 2059 table. */
++#define HT5G(_channel) CHAN5G(_channel, 0)
++static struct ieee80211_channel b43_5ghz_htphy_chantable[] = {
++	HT5G(36),  HT5G(40),  HT5G(44),  HT5G(48),
++	HT5G(52),  HT5G(56),  HT5G(60),  HT5G(64),
++	HT5G(100), HT5G(104), HT5G(108), HT5G(112),
++	HT5G(116), HT5G(120), HT5G(124), HT5G(128),
++	HT5G(132), HT5G(136), HT5G(140),
++	HT5G(149), HT5G(153), HT5G(157), HT5G(161), HT5G(165),
++};
++#undef HT5G
++
+ #undef CHAN5G
+ 
+ static struct ieee80211_supported_band b43_band_5GHz_nphy = {
+@@ -327,6 +356,14 @@
+ 	.n_bitrates	= b43_a_ratetable_size,
+ };
+ 
++static struct ieee80211_supported_band b43_band_5GHz_htphy = {
++	.band		= NL80211_BAND_5GHZ,
++	.channels	= b43_5ghz_htphy_chantable,
++	.n_channels	= ARRAY_SIZE(b43_5ghz_htphy_chantable),
++	.bitrates	= b43_a_ratetable,
++	.n_bitrates	= b43_a_ratetable_size,
++};
++
+ static struct ieee80211_supported_band b43_band_5GHz_nphy_limited = {
+ 	.band		= NL80211_BAND_5GHZ,
+ 	.channels	= b43_5ghz_nphy_chantable_limited,
+@@ -351,6 +388,38 @@
+ 	.n_bitrates	= b43_g_ratetable_size,
+ };
+ 
++static struct ieee80211_supported_band b43_band_2GHz_htphy = {
++	.band		= NL80211_BAND_2GHZ,
++	.channels	= b43_2ghz_chantable,
++	.n_channels	= ARRAY_SIZE(b43_2ghz_chantable),
++	.bitrates	= b43_g_ratetable,
++	.n_bitrates	= b43_g_ratetable_size,
++};
++
++/* As the proprietary driver advertises on this chip: LDPC receive, no STBC
++ * either way. (It also claims greenfield receive; untested, no AP here
++ * sends it.) We transmit BCC only. MCS 0-23 for the three RX chains; up to
++ * 64 KiB RX A-MPDUs.
++ */
++static void b43_htphy_fill_ht_cap(struct ieee80211_sta_ht_cap *ht, bool ht40)
++{
++	memset(ht, 0, sizeof(*ht));
++	ht->ht_supported = true;
++	ht->cap = WLAN_HT_CAP_SM_PS_DISABLED << IEEE80211_HT_CAP_SM_PS_SHIFT;
++	ht->cap |= IEEE80211_HT_CAP_SGI_20;
++	/* The AP sends LDPC at moderate load; 0.08 % retries there */
++	ht->cap |= IEEE80211_HT_CAP_LDPC_CODING;
++	if (ht40)
++		ht->cap |= IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
++			   IEEE80211_HT_CAP_SGI_40;
++	ht->ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K;
++	ht->ampdu_density = IEEE80211_HT_MPDU_DENSITY_4;
++	ht->mcs.rx_mask[0] = 0xff;
++	ht->mcs.rx_mask[1] = 0xff;
++	ht->mcs.rx_mask[2] = 0xff;
++	ht->mcs.tx_params = IEEE80211_HT_MCS_TX_DEFINED;
++}
++
+ static struct ieee80211_supported_band b43_band_2ghz_limited = {
+ 	.band		= NL80211_BAND_2GHZ,
+ 	.channels	= b43_2ghz_chantable,
+@@ -703,17 +772,30 @@
+ 
+ static void b43_upload_card_macaddress(struct b43_wldev *dev)
+ {
++	const u8 *mac = dev->wl->mac_addr;
++
+ 	b43_write_mac_bssid_templates(dev);
+-	b43_macfilter_set(dev, B43_MACFILTER_SELF, dev->wl->mac_addr);
++	b43_macfilter_set(dev, B43_MACFILTER_SELF, mac);
++	/* The ucode's BlockAck template (brcmsmac's T_BA_TPL_BASE) takes the
++	 * TA at offset 16; without it our BlockAcks go out from
++	 * 00:00:00:00:00:00. The proprietary driver writes the same.
++	 */
++	if (dev->phy.type == B43_PHYTYPE_HT) {
++		b43_ram_write(dev, 0x38 + 16, get_unaligned_le32(mac));
++		b43_ram_write(dev, 0x38 + 20, get_unaligned_le16(mac + 4));
++	}
+ }
+ 
+ static void b43_set_slot_time(struct b43_wldev *dev, u16 slot_time)
+ {
+ 	/* slot_time is in usec. */
+-	/* This test used to exit for all but a G PHY. */
+-	if (b43_current_band(dev->wl) == NL80211_BAND_5GHZ)
++	/* This test used to exit for all but a G PHY. HT-PHY on 5 GHz needs the
++	 * 9 us slot too; wl programs IFSSLOT = 510 + 9 there. */
++	if (b43_current_band(dev->wl) == NL80211_BAND_5GHZ &&
++	    dev->phy.type != B43_PHYTYPE_HT)
+ 		return;
+ 	b43_write16(dev, B43_MMIO_IFSSLOT, 510 + slot_time);
++	dev->wl->slot_time = slot_time;
+ 	/* Shared memory location 0x0010 is the slot time and should be
+ 	 * set to slot_time; however, this register is initially 0 and changing
+ 	 * the value adversely affects the transmit rate for BCM4311
+@@ -1237,7 +1319,15 @@
+ 	/* Put PHY into reset */
+ 	flags = bcma_aread32(dev->dev->bdev, BCMA_IOCTL);
+ 	flags |= B43_BCMA_IOCTL_PHY_RESET;
+-	flags |= B43_BCMA_IOCTL_PHY_BW_20MHZ; /* Make 20 MHz def */
++	flags &= ~B43_BCMA_IOCTL_PHY_BW;
++	/* The configured width: after a controller restart the PHY init that
++	 * follows must come back on the 40 MHz channel we are associated on
++	 */
++	dev->phy.bw40 = dev->phy.type == B43_PHYTYPE_HT &&
++		dev->wl->hw->conf.chandef.chan &&
++		dev->wl->hw->conf.chandef.width == NL80211_CHAN_WIDTH_40;
++	flags |= dev->phy.bw40 ? B43_BCMA_IOCTL_PHY_BW_40MHZ :
++				 B43_BCMA_IOCTL_PHY_BW_20MHZ;
+ 	bcma_awrite32(dev->dev->bdev, BCMA_IOCTL, flags);
+ 	udelay(2);
+ 
+@@ -1353,6 +1443,34 @@
+ 		stat.intermediate = !!(tmp & 0x0040);
+ 		stat.for_ampdu = !!(tmp & 0x0020);
+ 		stat.acked = !!(tmp & 0x0002);
++		stat.ba = false;
++		if (stat.for_ampdu && stat.acked) {
++			/* A BlockAck came back: its bitmap follows as a second
++			 * status (brcmsmac's ampdu_dotxstatus)
++			 */
++			u32 s1, s2;
++			int i;
++
++			for (i = 0; i < 10; i++) {
++				s1 = b43_read32(dev, B43_MMIO_XMITSTAT_0);
++				if (s1 & 0x00000001)
++					break;
++				udelay(1);
++			}
++			if (s1 & 0x00000001) {
++				s2 = b43_read32(dev, B43_MMIO_XMITSTAT_1);
++				stat.ba = true;
++				stat.ba_start = stat.seq >> 4;
++				stat.ba_bitmap[0] = (tmp >> 12) | ((s1 & 0x1E) << 3);
++				stat.ba_bitmap[1] = s1 >> 8;
++				stat.ba_bitmap[2] = s1 >> 16;
++				stat.ba_bitmap[3] = s1 >> 24;
++				stat.ba_bitmap[4] = s2;
++				stat.ba_bitmap[5] = s2 >> 8;
++				stat.ba_bitmap[6] = s2 >> 16;
++				stat.ba_bitmap[7] = s2 >> 24;
++			}
++		}
+ 
+ 		b43_handle_txstatus(dev, &stat);
+ 	}
+@@ -2588,7 +2706,8 @@
+ start_ieee80211:
+ 	wl->hw->queues = B43_QOS_QUEUE_NUM;
+ 	if (!modparam_qos || dev->fw.opensource ||
+-	    dev->dev->chip_id == BCMA_CHIP_ID_BCM4331)
++	    (dev->dev->chip_id == BCMA_CHIP_ID_BCM4331 && !modparam_qos4331 &&
++	     !modparam_htphy_11n))
+ 		wl->hw->queues = 1;
+ 
+ 	err = ieee80211_register_hw(wl->hw);
+@@ -3580,6 +3699,164 @@
+ 	return err;
+ }
+ 
++static bool b43_ampdu_candidate(struct b43_wldev *dev, struct sk_buff *skb)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++
++	return (info->flags & IEEE80211_TX_CTL_AMPDU) &&
++	       (info->control.rates[0].flags & IEEE80211_TX_RC_MCS) &&
++	       ieee80211_is_data_qos(((struct ieee80211_hdr *)skb->data)->frame_control) &&
++	       !b43_using_pio_transfers(dev);
++}
++
++/* Build an A-MPDU from @skb and the following frames of the queue for the
++ * same TID, and hand it to DMA. Limits: the recipient's window and max
++ * length, and 3 ms on the air. On -ENOSPC everything is back in the queue.
++ */
++static int b43_tx_ampdu(struct b43_wldev *dev, int queue_num,
++			struct sk_buff *skb)
++{
++	static const u8 spacing_qus[8] = { 0, 1, 2, 4, 8, 16, 32, 64 };
++	struct b43_wl *wl = dev->wl;
++	struct sk_buff_head *q = &wl->tx_queue[queue_num];
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++	struct ieee80211_tx_rate *rate = &info->control.rates[0];
++	u8 tid = ieee80211_get_tid(hdr);
++	unsigned int kbps, max_len, max_frames, min_bytes, total = 0, len = 0;
++	struct sk_buff_head agg;
++	u8 ndelim[64];
++	unsigned int n = 0, i;
++	u16 ssn;
++	int err;
++
++	if (wl->ampdu_nssn[tid] >= ARRAY_SIZE(wl->ampdu_ssn[0])) {
++		skb_queue_head(q, skb);
++		return -EBUSY;
++	}
++	/* The recipient's window starts at the oldest MPDU not yet acked:
++	 * ours (retries come first) or one in flight. Anything 64 or more
++	 * past it makes the recipient move its window and drop the old ones.
++	 */
++	ssn = le16_to_cpu(hdr->seq_ctrl) >> 4;
++	for (i = 0; i < wl->ampdu_nssn[tid]; i++)
++		if (((ssn - wl->ampdu_ssn[tid][i]) & 0xFFF) < 0x800)
++			ssn = wl->ampdu_ssn[tid][i];
++
++	kbps = b43_ht_rate_kbps(rate->idx,
++				rate->flags & IEEE80211_TX_RC_SHORT_GI,
++				dev->phy.bw40 &&
++				rate->flags & IEEE80211_TX_RC_40_MHZ_WIDTH);
++	/* 3 ms on the air (brcmsmac: 5 ms). Measured at MCS 15 up to 5 ms
++	 * without losses at the tail; on a busy 2.4 GHz channel TCP did a
++	 * bit worse at 5 ms than at 3.
++	 */
++	max_len = min(wl->ampdu_max_len, kbps * 3 / 8);
++	/* MPDU start spacing: the recipient's, but at least 16 us. DMA
++	 * fetches every MPDU separately and can't keep up with a run of tiny
++	 * ones (TCP ACKs) at high MCS: the TX FIFO underflows and the PHY
++	 * aborts. Null delimiters give it time: at 40 MHz MCS 15, 10 us left
++	 * ~75 underflows a second, 16 us none. (Setting the TX header's
++	 * preload size instead stalls the ucode with this firmware.)
++	 */
++	min_bytes = max(spacing_qus[wl->ampdu_density & 7] * kbps / 32000,
++			kbps * 16 / 8000);
++	max_frames = min_t(unsigned int, wl->ampdu_buf[tid] ? : 1,
++			   ARRAY_SIZE(ndelim));
++	max_frames = min_t(unsigned int, max_frames,
++			   b43_dma_tx_free_frames(dev, skb));
++	if (!max_frames) {
++		skb_queue_head(q, skb);
++		return -ENOSPC;
++	}
++
++	__skb_queue_head_init(&agg);
++	while (1) {
++		struct ieee80211_hdr *h = (struct ieee80211_hdr *)skb->data;
++		unsigned int add;
++		u8 nd;
++
++		len = b43_tx_mpdu_len(skb);
++		/* Up to 124 null delimiters work; from 127 on the PHY aborts
++		 * the A-MPDU (txphyerr counts every one)
++		 */
++		nd = min_t(unsigned int, len < min_bytes ?
++			   DIV_ROUND_UP(min_bytes - len, 4) : 0, 120);
++		add = round_up(len, 4) + 4 * (nd + 1);
++		if (n) {
++			struct ieee80211_tx_info *ni = IEEE80211_SKB_CB(skb);
++
++			if (!(ni->flags & IEEE80211_TX_CTL_AMPDU) ||
++			    !ieee80211_is_data_qos(h->frame_control) ||
++			    ieee80211_get_tid(h) != tid ||
++			    !ether_addr_equal(h->addr1, hdr->addr1) ||
++			    total + add > max_len ||
++			    (((le16_to_cpu(h->seq_ctrl) >> 4) - ssn) & 0xFFF) >=
++			    (wl->ampdu_buf[tid] ? : 1))
++				break;
++			skb = skb_dequeue(q);
++			/* One PPDU, one rate */
++			memcpy(ni->control.rates, info->control.rates,
++			       2 * sizeof(ni->control.rates[0]));
++		}
++		__skb_queue_tail(&agg, skb);
++		ndelim[n++] = nd;
++		total += add;
++		if (n >= max_frames)
++			break;
++		skb = skb_peek(q);
++		if (!skb)
++			break;
++	}
++	/* Nothing after the last MPDU: no padding, no null delimiters */
++	skb = skb_peek_tail(&agg);
++	len = b43_tx_mpdu_len(skb);
++	total -= round_up(len, 4) - len + 4 * ndelim[n - 1];
++	ndelim[n - 1] = 0;
++
++	ssn = le16_to_cpu(hdr->seq_ctrl) >> 4;
++	err = b43_dma_tx_ampdu(dev, &agg, ndelim, total);
++	if (!err)
++		wl->ampdu_ssn[tid][wl->ampdu_nssn[tid]++] = ssn;
++	if (err) {
++		unsigned long flags;
++
++		if (err != -ENOSPC) {
++			while ((skb = __skb_dequeue(&agg)))
++				ieee80211_free_txskb(wl->hw, skb);
++			return 0;
++		}
++		spin_lock_irqsave(&q->lock, flags);
++		skb_queue_splice(&agg, q);
++		spin_unlock_irqrestore(&q->lock, flags);
++	}
++	return err;
++}
++
++/* The microcode writes the power management bit of every frame it sends
++ * from the MAC control register's hardware power save bit, so mac80211's
++ * nullfunc frames announcing that we leave the channel (software scan)
++ * went out with PM clear. The AP kept transmitting to us while we were
++ * away and lost those frames: a background scan cost several seconds of
++ * traffic. Follow the PM bit of the nullfunc frames mac80211 sends; we
++ * stay awake either way.
++ */
++static void b43_tx_follow_pm(struct b43_wldev *dev, struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++	u32 macctl;
++
++	if (!ieee80211_is_nullfunc(hdr->frame_control) &&
++	    !ieee80211_is_qos_nullfunc(hdr->frame_control))
++		return;
++	macctl = b43_read32(dev, B43_MMIO_MACCTL);
++	if (ieee80211_has_pm(hdr->frame_control))
++		macctl |= B43_MACCTL_HWPS;
++	else
++		macctl &= ~B43_MACCTL_HWPS;
++	b43_write32(dev, B43_MMIO_MACCTL, macctl);
++}
++
+ static void b43_tx_work(struct work_struct *work)
+ {
+ 	struct b43_wl *wl = container_of(work, struct b43_wl, tx_work);
+@@ -3598,6 +3875,26 @@
+ 	for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
+ 		while (skb_queue_len(&wl->tx_queue[queue_num])) {
+ 			skb = skb_dequeue(&wl->tx_queue[queue_num]);
++			if (b43_ampdu_candidate(dev, skb)) {
++				if (b43_dma_ampdu_busy(dev, skb)) {
++					/* Let more frames gather; the TX
++					 * status of one in flight brings us
++					 * back
++					 */
++					skb_queue_head(&wl->tx_queue[queue_num], skb);
++					break;
++				}
++				err = b43_tx_ampdu(dev, queue_num, skb);
++				if (err == -EBUSY)
++					break;
++				if (err == -ENOSPC) {
++					wl->tx_queue_stopped[queue_num] = true;
++					b43_stop_queue(dev, queue_num);
++					break;
++				}
++				continue;
++			}
++			b43_tx_follow_pm(dev, skb);
+ 			if (b43_using_pio_transfers(dev))
+ 				err = b43_pio_tx(dev, skb);
+ 			else
+@@ -3637,8 +3934,20 @@
+ 	}
+ 	B43_WARN_ON(skb_shinfo(skb)->nr_frags);
+ 
++	if (unlikely(modparam_htphy_5ghz == 1 &&
++		     b43_current_band(wl) == NL80211_BAND_5GHZ)) {
++		/* Receive-only experiment: never put a frame on the air. */
++		ieee80211_free_txskb(hw, skb);
++		return;
++	}
++
+ 	skb_queue_mapping = skb_get_queue_mapping(skb);
+ 	skb_queue_tail(&wl->tx_queue[skb_queue_mapping], skb);
++	/* Frames waiting to be aggregated: don't take unbounded amounts.
++	 * The next TX status wakes the queue again.
++	 */
++	if (skb_queue_len(&wl->tx_queue[skb_queue_mapping]) > 128)
++		ieee80211_stop_queue(hw, skb_queue_mapping);
+ 	if (!wl->tx_queue_stopped[skb_queue_mapping])
+ 		ieee80211_queue_work(wl->hw, &wl->tx_work);
+ 	else
+@@ -3883,9 +4192,15 @@
+ 
+ /* Expects wl->mutex locked */
+ static int b43_switch_band(struct b43_wldev *dev,
+-			   struct ieee80211_channel *chan)
++			   const struct cfg80211_chan_def *chandef)
+ {
++	struct ieee80211_channel *chan = chandef->chan;
+ 	struct b43_phy *phy = &dev->phy;
++	/* The bandwidth is the core's PHY clock (80 or 160 MHz), so changing
++	 * it takes a PHY reset and re-init like a band switch
++	 */
++	bool bw40 = phy->type == B43_PHYTYPE_HT &&
++		    chandef->width == NL80211_CHAN_WIDTH_40;
+ 	bool gmode;
+ 	u32 tmp;
+ 
+@@ -3908,19 +4223,20 @@
+ 		return -ENODEV;
+ 	}
+ 
+-	if (!!phy->gmode == !!gmode) {
++	if (!!phy->gmode == !!gmode && phy->bw40 == bw40) {
+ 		/* This device is already running. */
+ 		return 0;
+ 	}
+ 
+-	b43dbg(dev->wl, "Switching to %s GHz band\n",
+-	       band_to_string(chan->band));
++	b43dbg(dev->wl, "Switching to %s GHz band, %d MHz\n",
++	       band_to_string(chan->band), bw40 ? 40 : 20);
+ 
+ 	/* Some new devices don't need disabling radio for band switching */
+ 	if (!(phy->type == B43_PHYTYPE_N && phy->rev >= 3))
+ 		b43_software_rfkill(dev, true);
+ 
+ 	phy->gmode = gmode;
++	phy->bw40 = bw40;
+ 	b43_phy_put_into_reset(dev);
+ 	switch (dev->dev->bus_type) {
+ #ifdef CONFIG_B43_BCMA
+@@ -3930,6 +4246,11 @@
+ 			tmp |= B43_BCMA_IOCTL_GMODE;
+ 		else
+ 			tmp &= ~B43_BCMA_IOCTL_GMODE;
++		if (phy->type == B43_PHYTYPE_HT) {
++			tmp &= ~B43_BCMA_IOCTL_PHY_BW;
++			tmp |= bw40 ? B43_BCMA_IOCTL_PHY_BW_40MHZ :
++				      B43_BCMA_IOCTL_PHY_BW_20MHZ;
++		}
+ 		bcma_awrite32(dev->dev->bdev, BCMA_IOCTL, tmp);
+ 		break;
+ #endif
+@@ -3950,6 +4271,13 @@
+ 
+ 	b43_phy_init(dev);
+ 
++	/* The band initvals reset IFSSLOT to the long slot. Without this a
++	 * scan touching the other band leaves the 5 GHz link on the 2.4 GHz
++	 * slot time (~25% less TX throughput on HT-PHY).
++	 */
++	if (dev->wl->slot_time)
++		b43_set_slot_time(dev, dev->wl->slot_time);
++
+ 	return 0;
+ }
+ 
+@@ -3993,9 +4321,12 @@
+ 	if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
+ 		phy->chandef = &conf->chandef;
+ 		phy->channel = conf->chandef.chan->hw_value;
++		phy->ctl_upper = conf->chandef.width == NL80211_CHAN_WIDTH_40 &&
++			conf->chandef.chan->center_freq >
++			conf->chandef.center_freq1;
+ 
+-		/* Switch the band (if necessary). */
+-		err = b43_switch_band(dev, conf->chandef.chan);
++		/* Switch the band and bandwidth (if necessary). */
++		err = b43_switch_band(dev, &conf->chandef);
+ 		if (err)
+ 			goto out_mac_enable;
+ 
+@@ -4151,6 +4482,13 @@
+ 			b43_short_slot_timing_disable(dev);
+ 	}
+ 
++	/* Calibrations skipped on a channel we could not transmit on yet
++	 * (5 GHz is passive-only until the regulatory domain is known)
++	 */
++	if (changed & BSS_CHANGED_ASSOC && vif->cfg.assoc &&
++	    dev->phy.type == B43_PHYTYPE_HT)
++		b43_phy_ht_recal(dev, true);
++
+ 	b43_mac_enable(dev);
+ out_unlock_mutex:
+ 	mutex_unlock(&wl->mutex);
+@@ -4213,7 +4551,8 @@
+ 		algorithm = B43_SEC_ALGO_AES;
+ 		break;
+ 	default:
+-		B43_WARN_ON(1);
++		/* e.g. BIP (AES-CMAC) for MFP: mac80211 does it in software */
++		err = -EOPNOTSUPP;
+ 		goto out_unlock;
+ 	}
+ 	index = (u8) (key->keyidx);
+@@ -4257,6 +4596,12 @@
+ 		key->flags |= IEEE80211_KEY_FLAG_GENERATE_IV;
+ 		if (algorithm == B43_SEC_ALGO_TKIP)
+ 			key->flags |= IEEE80211_KEY_FLAG_GENERATE_MMIC;
++		/* The engine predates 802.11w and gets the CCMP of protected
++		 * management frames wrong: the peer drops e.g. our ADDBA
++		 * responses and SA Query replies. Let mac80211 do those.
++		 */
++		if (algorithm == B43_SEC_ALGO_AES)
++			key->flags |= IEEE80211_KEY_FLAG_SW_MGMT_TX;
+ 		break;
+ 	case DISABLE_KEY: {
+ 		err = b43_key_clear(dev, key->hw_key_idx);
+@@ -4857,6 +5202,15 @@
+ 		goto err_busdown;
+ 	b43_shm_write16(dev, B43_SHM_SHARED,
+ 			B43_SHM_SH_WLCOREREV, dev->dev->core_rev);
++	if (phy->type == B43_PHYTYPE_HT && modparam_htphy_11n) {
++		/* Let the ucode receive up to 64 KiB A-MPDUs: max symbols and
++		 * its internal watchdog (8 TU units). Same SHM words as
++		 * brcmsmac's M_MIMO_MAXSYM / M_WATCHDOG_8TU; the proprietary
++		 * driver writes the same values.
++		 */
++		b43_shm_write16(dev, B43_SHM_SHARED, 0x00BA, 0xFFFF);
++		b43_shm_write16(dev, B43_SHM_SHARED, 0x003C, 10);
++	}
+ 	hf = b43_hf_read(dev);
+ 	if (phy->type == B43_PHYTYPE_G) {
+ 		hf |= B43_HF_SYMW;
+@@ -5131,6 +5485,7 @@
+ 	struct b43_wldev *dev;
+ 
+ 	mutex_lock(&wl->mutex);
++	wl->scanning = true;
+ 	dev = wl->current_dev;
+ 	if (dev && (b43_status(dev) >= B43_STAT_INITIALIZED)) {
+ 		/* Disable CFP update during scan on other channels. */
+@@ -5146,10 +5501,43 @@
+ 	struct b43_wldev *dev;
+ 
+ 	mutex_lock(&wl->mutex);
++	wl->scanning = false;
+ 	dev = wl->current_dev;
+ 	if (dev && (b43_status(dev) >= B43_STAT_INITIALIZED)) {
+ 		/* Re-enable CFP update. */
+ 		b43_hf_write(dev, b43_hf_read(dev) & ~B43_HF_SKCFPUP);
++		/* Back for good: frames go out with PM clear again */
++		b43_maskset32(dev, B43_MMIO_MACCTL, ~B43_MACCTL_HWPS, 0);
++		/* Calibrations skipped while scanning */
++		if (dev->phy.type == B43_PHYTYPE_HT) {
++			b43_mac_suspend(dev);
++			b43_phy_ht_recal(dev, false);
++			b43_mac_enable(dev);
++		}
++	}
++	mutex_unlock(&wl->mutex);
++}
++
++/* mac80211 is about to send auth/assoc on this channel. After a disconnect
++ * the world regdomain marks 5 GHz passive, so the channel switch skipped
++ * calibrating; uncalibrated at 40 MHz we missed the AP's responses and
++ * (re)connecting took up to 15 s. Transmitting is allowed now, as it is for
++ * these frames.
++ */
++static void b43_op_mgd_prepare_tx(struct ieee80211_hw *hw,
++				  struct ieee80211_vif *vif,
++				  struct ieee80211_prep_tx_info *info)
++{
++	struct b43_wl *wl = hw_to_b43_wl(hw);
++	struct b43_wldev *dev;
++
++	mutex_lock(&wl->mutex);
++	dev = wl->current_dev;
++	if (dev && b43_status(dev) >= B43_STAT_STARTED &&
++	    dev->phy.type == B43_PHYTYPE_HT) {
++		b43_mac_suspend(dev);
++		b43_phy_ht_recal(dev, true);
++		b43_mac_enable(dev);
+ 	}
+ 	mutex_unlock(&wl->mutex);
+ }
+@@ -5171,6 +5559,45 @@
+ 	return 0;
+ }
+ 
++/* Receive aggregation is all in the ucode (it answers with the BlockAck)
++ * and mac80211 (reordering), as with brcmsmac. Transmit aggregation: we
++ * chain the MPDUs in the DMA ring (b43_tx_ampdu), the ucode sends them as
++ * one PPDU and reports the BlockAck.
++ */
++static int b43_op_ampdu_action(struct ieee80211_hw *hw,
++			       struct ieee80211_vif *vif,
++			       struct ieee80211_ampdu_params *params)
++{
++	struct b43_wl *wl = hw_to_b43_wl(hw);
++	struct ieee80211_sta *sta = params->sta;
++
++	switch (params->action) {
++	case IEEE80211_AMPDU_RX_START:
++	case IEEE80211_AMPDU_RX_STOP:
++		return 0;
++	case IEEE80211_AMPDU_TX_START:
++		if (modparam_htphy_11n < 2 || vif->type != NL80211_IFTYPE_STATION)
++			return -EOPNOTSUPP;
++		return IEEE80211_AMPDU_TX_START_IMMEDIATE;
++	case IEEE80211_AMPDU_TX_OPERATIONAL:
++		wl->ampdu_nssn[params->tid] = 0;
++		wl->ampdu_bar_ssn[params->tid] = 0;
++		wl->ampdu_max_len = (1 << (IEEE80211_HT_MAX_AMPDU_FACTOR +
++					   sta->deflink.ht_cap.ampdu_factor)) - 1;
++		wl->ampdu_density = sta->deflink.ht_cap.ampdu_density;
++		wl->ampdu_buf[params->tid] = min_t(u16, params->buf_size, 64);
++		return 0;
++	case IEEE80211_AMPDU_TX_STOP_CONT:
++	case IEEE80211_AMPDU_TX_STOP_FLUSH:
++	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
++		wl->ampdu_buf[params->tid] = 0;
++		ieee80211_stop_tx_ba_cb_irqsafe(vif, sta->addr, params->tid);
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
+ static const struct ieee80211_ops b43_hw_ops = {
+ 	.add_chanctx = ieee80211_emulate_add_chanctx,
+ 	.remove_chanctx = ieee80211_emulate_remove_chanctx,
+@@ -5197,6 +5624,8 @@
+ 	.sw_scan_complete	= b43_op_sw_scan_complete_notifier,
+ 	.get_survey		= b43_op_get_survey,
+ 	.rfkill_poll		= b43_rfkill_poll,
++	.ampdu_action		= b43_op_ampdu_action,
++	.mgd_prepare_tx		= b43_op_mgd_prepare_tx,
+ };
+ 
+ /* Hard-reset the chip. Do not call this directly.
+@@ -5224,6 +5653,24 @@
+ 	if (prev_status >= B43_STAT_INITIALIZED)
+ 		b43_wireless_core_exit(dev);
+ 
++	/* Running: let mac80211 bring us up again and replay the whole
++	 * configuration. Re-initialising here and reloading only the config
++	 * and BSS info left the key memory, which the init clears, empty:
++	 * with WPA every frame was then dropped for want of its key
++	 * (-ENOKEY), so the link never came back. mac80211 adds the
++	 * interface again, so it must look removed.
++	 */
++	if (prev_status >= B43_STAT_STARTED) {
++		wl->operating = false;
++		wl->vif = NULL;
++		memset(wl->ampdu_buf, 0, sizeof(wl->ampdu_buf));
++		memset(wl->ampdu_nssn, 0, sizeof(wl->ampdu_nssn));
++		mutex_unlock(&wl->mutex);
++		ieee80211_restart_hw(wl->hw);
++		b43info(wl, "Controller restart handed to mac80211\n");
++		return;
++	}
++
+ 	/* ...and up again. */
+ 	if (prev_status >= B43_STAT_INITIALIZED) {
+ 		err = b43_wireless_core_init(dev);
+@@ -5272,7 +5719,37 @@
+ 	if (have_2ghz_phy)
+ 		hw->wiphy->bands[NL80211_BAND_2GHZ] = limited_2g ?
+ 			&b43_band_2ghz_limited : &b43_band_2GHz;
+-	if (dev->phy.type == B43_PHYTYPE_N) {
++	if (dev->phy.type == B43_PHYTYPE_HT) {
++		if (have_2ghz_phy) {
++			b43_band_2GHz_htphy.ht_cap.ht_supported = false;
++			/* 20 MHz only on 2.4 GHz, as the proprietary
++			 * driver does: at 40 MHz a fifth of the CCK frames
++			 * (beacons, auth/assoc responses) were lost, so
++			 * connecting often took 10 s.
++			 */
++			if (modparam_htphy_11n)
++				b43_htphy_fill_ht_cap(&b43_band_2GHz_htphy.ht_cap,
++						      false);
++			hw->wiphy->bands[NL80211_BAND_2GHZ] = &b43_band_2GHz_htphy;
++		}
++		if (have_5ghz_phy) {
++			struct ieee80211_supported_band *b = &b43_band_5GHz_htphy;
++			int i;
++
++			/* Receive-only: mac80211 never transmits on NO_IR channels. */
++			for (i = 0; i < b->n_channels; i++)
++				if (modparam_htphy_5ghz == 1)
++					b->channels[i].flags |= IEEE80211_CHAN_NO_IR;
++			if (modparam_htphy_5ghz == 1)
++				hw->wiphy->regulatory_flags |=
++					REGULATORY_DISABLE_BEACON_HINTS;
++			b->ht_cap.ht_supported = false;
++			if (modparam_htphy_11n)
++				b43_htphy_fill_ht_cap(&b->ht_cap,
++						      modparam_htphy_11n >= 3);
++			hw->wiphy->bands[NL80211_BAND_5GHZ] = b;
++		}
++	} else if (dev->phy.type == B43_PHYTYPE_N) {
+ 		if (have_5ghz_phy)
+ 			hw->wiphy->bands[NL80211_BAND_5GHZ] = limited_5g ?
+ 				&b43_band_5GHz_nphy_limited :
+@@ -5427,9 +5904,16 @@
+ 	/* We don't support 5 GHz on some PHYs yet */
+ 	if (have_5ghz_phy) {
+ 		switch (dev->phy.type) {
++		case B43_PHYTYPE_HT:
++			if (modparam_htphy_5ghz) {
++				b43warn(wl, "EXPERIMENTAL 5 GHz on HT-PHY enabled (%s)\n",
++					modparam_htphy_5ghz == 1 ?
++					"receive only" : "full");
++				break;
++			}
++			fallthrough;
+ 		case B43_PHYTYPE_G:
+ 		case B43_PHYTYPE_LP:
+-		case B43_PHYTYPE_HT:
+ 			b43warn(wl, "5 GHz band is unsupported on this PHY\n");
+ 			have_5ghz_phy = false;
+ 		}
+@@ -5579,6 +6063,8 @@
+ 	ieee80211_hw_set(hw, RX_INCLUDES_FCS);
+ 	ieee80211_hw_set(hw, SIGNAL_DBM);
+ 	ieee80211_hw_set(hw, MFP_CAPABLE);
++	if (modparam_htphy_11n)
++		ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+ 	hw->wiphy->interface_modes =
+ 		BIT(NL80211_IFTYPE_AP) |
+ 		BIT(NL80211_IFTYPE_MESH_POINT) |
+diff --git a/drivers/net/wireless/broadcom/b43/main.h b/drivers/net/wireless/broadcom/b43/main.h
+--- a/drivers/net/wireless/broadcom/b43/main.h
++++ b/drivers/net/wireless/broadcom/b43/main.h
+@@ -27,6 +27,7 @@
+ 
+ 
+ extern int b43_modparam_verbose;
++extern int b43_modparam_txant;
+ 
+ /* Logmessage verbosity levels. Update the b43_modparam_verbose helptext, if
+  * you add or remove levels. */
+diff --git a/drivers/net/wireless/broadcom/b43/phy_common.c b/drivers/net/wireless/broadcom/b43/phy_common.c
+--- a/drivers/net/wireless/broadcom/b43/phy_common.c
++++ b/drivers/net/wireless/broadcom/b43/phy_common.c
+@@ -423,11 +423,17 @@
+ 	 * firmware from sending ghost packets.
+ 	 */
+ 	channelcookie = new_channel;
++	/* 40 MHz wide: the centre channel, as brcmsmac and the proprietary
++	 * driver. Not B43_SHM_SH_CHAN_40MHZ though (which they also set):
++	 * firmware 666.2 then suppresses every frame for channel mismatch,
++	 * it compares the TX header's channel only with 5 GHz flag added.
++	 */
++	if (phy->bw40)
++		channelcookie = ieee80211_frequency_to_channel(
++					phy->chandef->center_freq1);
++	phy->cookie_chan = channelcookie;
+ 	if (b43_current_band(dev->wl) == NL80211_BAND_5GHZ)
+ 		channelcookie |= B43_SHM_SH_CHAN_5GHZ;
+-	/* FIXME: set 40Mhz flag if required */
+-	if (0)
+-		channelcookie |= B43_SHM_SH_CHAN_40MHZ;
+ 	savedcookie = b43_shm_read16(dev, B43_SHM_SHARED, B43_SHM_SH_CHAN);
+ 	b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_CHAN, channelcookie);
+ 
+diff --git a/drivers/net/wireless/broadcom/b43/phy_common.h b/drivers/net/wireless/broadcom/b43/phy_common.h
+--- a/drivers/net/wireless/broadcom/b43/phy_common.h
++++ b/drivers/net/wireless/broadcom/b43/phy_common.h
+@@ -259,6 +259,15 @@
+ 	/* Current channel */
+ 	struct cfg80211_chan_def *chandef;
+ 	unsigned int channel;
++	/* The PHY runs 40 MHz wide (HT-PHY): set with the core's PHY clock in
++	 * b43_switch_band(). ctl_upper: the primary 20 MHz is the upper half.
++	 */
++	bool bw40;
++	bool ctl_upper;
++	/* Channel number in the SHM channel cookie, which TX headers repeat:
++	 * the centre channel when 40 MHz wide
++	 */
++	u8 cookie_chan;
+ 
+ 	/* PHY TX errors counter. */
+ 	atomic_t txerr_cnt;
+diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/broadcom/b43/phy_ht.c
+--- a/drivers/net/wireless/broadcom/b43/phy_ht.c
++++ b/drivers/net/wireless/broadcom/b43/phy_ht.c
+@@ -346,12 +346,18 @@
+ 
+ 	b43_phy_mask(dev, B43_PHY_HT_SAMP_CMD, ~0x0004);
+ 
++	/* Each core's BB multiplier lives at 0x63 + 4 * core with a copy at
++	 * 0x73 + 4 * core (upstream wrote 0x67 + 4 * core, clobbering the next
++	 * core's value). Forget the saved value afterwards, otherwise the one
++	 * saved on the first channel is restored forever after.
++	 */
+ 	for (i = 0; i < 3; i++) {
+ 		if (phy_ht->bb_mult_save[i] >= 0) {
+ 			b43_httab_write(dev, B43_HTTAB16(13, 0x63 + i * 4),
+ 					phy_ht->bb_mult_save[i]);
+-			b43_httab_write(dev, B43_HTTAB16(13, 0x67 + i * 4),
++			b43_httab_write(dev, B43_HTTAB16(13, 0x73 + i * 4),
+ 					phy_ht->bb_mult_save[i]);
++			phy_ht->bb_mult_save[i] = -1;
+ 		}
+ 	}
+ }
+@@ -372,7 +378,7 @@
+ }
+ 
+ static void b43_phy_ht_run_samples(struct b43_wldev *dev, u16 samps, u16 loops,
+-				   u16 wait)
++				   u16 wait, bool iqmode)
+ {
+ 	struct b43_phy_ht *phy_ht = dev->phy.ht;
+ 	u16 save_seq_mode;
+@@ -396,8 +402,14 @@
+ 	/* TODO: find out mask bits! Do we need more function arguments? */
+ 	b43_phy_mask(dev, B43_PHY_HT_SAMP_CMD, ~0);
+ 	b43_phy_mask(dev, B43_PHY_HT_SAMP_CMD, ~0);
+-	b43_phy_mask(dev, B43_PHY_HT_IQLOCAL_CMDGCTL, ~0);
+-	b43_phy_set(dev, B43_PHY_HT_SAMP_CMD, 0x1);
++	if (iqmode) {
++		/* Play through the I/Q LO calibration engine instead */
++		b43_phy_mask(dev, B43_PHY_HT_IQLOCAL_CMDGCTL, 0x7FFF);
++		b43_phy_set(dev, B43_PHY_HT_IQLOCAL_CMDGCTL, 0x8000);
++	} else {
++		b43_phy_mask(dev, B43_PHY_HT_IQLOCAL_CMDGCTL, ~0);
++		b43_phy_set(dev, B43_PHY_HT_SAMP_CMD, 0x1);
++	}
+ 
+ 	for (i = 0; i < 100; i++) {
+ 		if (!(b43_phy_read(dev, B43_PHY_HT_RF_SEQ_STATUS) & 1)) {
+@@ -417,7 +429,7 @@
+ 	u16 samp;
+ 
+ 	samp = b43_phy_ht_load_samples(dev);
+-	b43_phy_ht_run_samples(dev, samp, 0xFFFF, 0);
++	b43_phy_ht_run_samples(dev, samp, 0xFFFF, 0, false);
+ }
+ 
+ /**************************************************
+@@ -446,7 +458,11 @@
+ 				continue;
+ 
+ 			switch (rssi_type) {
++			/* The proprietary driver programs the same AFE
++			 * override and radio mux on 5 GHz.
++			 */
+ 			case HT_RSSI_TSSI_2G:
++			case HT_RSSI_TSSI_5G:
+ 				b43_phy_set(dev, ctl_regs[core][0], 0x3 << 8);
+ 				b43_phy_set(dev, ctl_regs[core][0], 0x3 << 10);
+ 				b43_phy_set(dev, ctl_regs[core][1], 0x1 << 9);
+@@ -508,13 +524,28 @@
+  * Tx/Rx
+  **************************************************/
+ 
++static void b43_phy_ht_tx_gain_table_upload(struct b43_wldev *dev,
++					     enum nl80211_band band)
++{
++	b43_httab_write_bulk(dev, B43_HTTAB32(0x1a, 0xc0),
++			     B43_HTTAB_1A_C0_LATE_SIZE,
++			     band == NL80211_BAND_5GHZ ?
++			     b43_httab_0x1a_0xc0_late_5g :
++			     b43_httab_0x1a_0xc0_late);
++}
++
+ static void b43_phy_ht_tx_power_fix(struct b43_wldev *dev)
+ {
++	/* Fixed gain index used while hardware power control is off. On 5 GHz
++	 * index 0x28 sits ~4 dB from where the PA starts to distort 54M OFDM;
++	 * 0x30 lands at the power the proprietary driver settles at.
++	 */
++	u16 idx = b43_current_band(dev->wl) == NL80211_BAND_5GHZ ? 0x30 : 0x28;
+ 	int i;
+ 
+ 	for (i = 0; i < 3; i++) {
+ 		u16 mask;
+-		u32 tmp = b43_httab_read(dev, B43_HTTAB32(26, 0xE8));
++		u32 tmp = b43_httab_read(dev, B43_HTTAB32(26, 0xC0 + idx));
+ 
+ 		if (0) /* FIXME */
+ 			mask = 0x2 << (i * 4);
+@@ -546,25 +577,30 @@
+ 
+ 	if (!enable) {
+ 		if (b43_phy_read(dev, B43_PHY_HT_TXPCTL_CMD_C1) & en_bits) {
+-			/* We disable enabled TX pwr ctl, save it's state */
++			/* We disable enabled TX pwr ctl, save it's state.
++			 * The status registers hold the current gain index
++			 * in bits 8-14; the low byte is the estimated output
++			 * power (it settles at the target power).
++			 */
+ 			for (i = 0; i < 3; i++)
+ 				phy_ht->tx_pwr_idx[i] =
+-					b43_phy_read(dev, status_regs[i]);
++					(b43_phy_read(dev, status_regs[i]) >> 8) &
++					B43_PHY_HT_TXPCTL_CMD_C1_INIT;
+ 		}
+ 		b43_phy_mask(dev, B43_PHY_HT_TXPCTL_CMD_C1, 0xffff & ~en_bits);
+ 	} else {
+ 		b43_phy_set(dev, B43_PHY_HT_TXPCTL_CMD_C1, en_bits);
+ 
+-		if (b43_current_band(dev->wl) == NL80211_BAND_5GHZ) {
+-			for (i = 0; i < 3; i++)
+-				b43_phy_write(dev, cmd_regs[i], 0x32);
+-		}
+ 
++		/* Only replace the index field: a plain write would also
++		 * clear the enable bits in CMD_C1 set above.
++		 */
+ 		for (i = 0; i < 3; i++)
+ 			if (phy_ht->tx_pwr_idx[i] <=
+ 			    B43_PHY_HT_TXPCTL_CMD_C1_INIT)
+-				b43_phy_write(dev, cmd_regs[i],
+-					      phy_ht->tx_pwr_idx[i]);
++				b43_phy_maskset(dev, cmd_regs[i],
++						~B43_PHY_HT_TXPCTL_CMD_C1_INIT,
++						phy_ht->tx_pwr_idx[i]);
+ 	}
+ 
+ 	phy_ht->tx_pwr_ctl = enable;
+@@ -591,7 +627,10 @@
+ 
+ 	b43_phy_ht_tx_tone(dev);
+ 	udelay(20);
+-	b43_phy_ht_poll_rssi(dev, HT_RSSI_TSSI_2G, rssi_buf, 1);
++	b43_phy_ht_poll_rssi(dev,
++			     b43_current_band(dev->wl) == NL80211_BAND_5GHZ ?
++			     HT_RSSI_TSSI_5G : HT_RSSI_TSSI_2G,
++			     rssi_buf, 1);
+ 	b43_phy_ht_stop_playback(dev);
+ 	b43_phy_ht_reset_cca(dev);
+ 
+@@ -618,6 +657,855 @@
+ 	}
+ }
+ 
++static void b43_phy_ht_tx_power_ctl_setup(struct b43_wldev *dev);
++
++/* Table 8 is the AFE control table (NPHY_TBL_ID_AFECTRL in brcmsmac): per
++ * core, entries 0x08-0x0b hold the aux ADC VMID and 0x0c-0x0f the aux ADC
++ * gain; the 4th slot is the one used for TSSI. As on N-PHY the right values
++ * depend on the power detector type (SPROM pdet_range) and the band, and
++ * unlike N-PHY they differ per core. Init only writes a band-agnostic set;
++ * with it core 2 under-reads TSSI by ~8 dB on 5 GHz and closed-loop power
++ * control drives its PA into saturation.
++ * Values for pdet_range 5 match what the proprietary driver writes on every
++ * channel switch (BCM4331, Apple boardtype 0xe4). Other detector types keep
++ * the init values, since we have no reference for them.
++ */
++/* RX gain tables (one per core: 0, 1 and 40 hold gains in dB, 2, 3 and 41 the
++ * matching gain codes). Entries 0x08-0x0b are the LNA1 steps and 0x10-0x13 the
++ * LNA2 steps; the AGC uses them to pick gains and to compute RSSI. Init only
++ * writes one LNA1 set (and leaves 0x20-0x29 at hardware defaults), so on
++ * 5 GHz the reported signal is ~5 dB below what the proprietary driver
++ * reports for the same AP. Values are what that driver writes on every
++ * channel switch; it uses three 5 GHz sub-bands. Its trace has no channels
++ * in 5500-5700 MHz, so those reuse the 5230-5320 MHz set.
++ */
++static void b43_phy_ht_rx_gain_setup(struct b43_wldev *dev,
++				     struct ieee80211_channel *channel)
++{
++	static const u16 lna1[4][4] = {
++		{ 0x09, 0x0f, 0x13, 0x18 },	/* 2.4 GHz */
++		{ 0x0b, 0x11, 0x15, 0x19 },	/* 5 GHz, up to 5220 MHz */
++		{ 0x0a, 0x10, 0x14, 0x18 },	/* 5 GHz, 5230-5700 MHz */
++		{ 0x0a, 0x0f, 0x13, 0x17 },	/* 5 GHz, from 5745 MHz */
++	};
++	static const u16 lna2[4][4] = {
++		{ 0xfd, 0x07, 0x0b, 0x0f },
++		{ 0x00, 0x07, 0x0b, 0x0e },
++		{ 0x00, 0x07, 0x0b, 0x0e },
++		{ 0x02, 0x09, 0x0d, 0x10 },
++	};
++	static const u16 gain_db[10] = { 0, 0, 0, 0, 3, 3, 3, 3, 3, 3 };
++	static const u16 gain_bits[10] = { 3, 3, 3, 3, 4, 4, 4, 4, 4, 4 };
++	static const u8 db_tab[3] = { 0, 1, 40 };
++	static const u8 bits_tab[3] = { 2, 3, 41 };
++	/* By the frequency the radio is tuned to: at 40 MHz on channel 44
++	 * the proprietary driver uses the 5230 MHz set
++	 */
++	u16 freq = dev->phy.bw40 ? dev->phy.chandef->center_freq1 :
++				   channel->center_freq;
++	int sb, c;
++
++	if (channel->band != NL80211_BAND_5GHZ)
++		sb = 0;
++	else if (freq <= 5220)
++		sb = 1;
++	else if (freq < 5745)
++		sb = 2;
++	else
++		sb = 3;
++
++	for (c = 0; c < 3; c++) {
++		b43_httab_write_bulk(dev, B43_HTTAB16(db_tab[c], 0x08), 4,
++				     lna1[sb]);
++		b43_httab_write_bulk(dev, B43_HTTAB16(db_tab[c], 0x10), 4,
++				     lna2[sb]);
++		b43_httab_write_bulk(dev, B43_HTTAB16(db_tab[c], 0x20), 10,
++				     gain_db);
++		b43_httab_write_bulk(dev, B43_HTTAB16(bits_tab[c], 0x20), 10,
++				     gain_bits);
++	}
++}
++
++static void b43_phy_ht_tssi_band_setup(struct b43_wldev *dev,
++				       enum nl80211_band band)
++{
++	static const u16 vmid_pdet5[2][3] = {
++		{ 0x96, 0x5a, 0x96 },	/* 2.4 GHz */
++		{ 0x91, 0x15c, 0x91 },	/* 5 GHz */
++	};
++	static const u16 gain_pdet5[2][3] = {
++		{ 0, 2, 0 },
++		{ 0, 5, 0 },
++	};
++	struct ssb_sprom *sprom = dev->dev->bus_sprom;
++	int b = band == NL80211_BAND_5GHZ;
++	u8 pdet_range = b ? sprom->fem.ghz5.pdet_range :
++			    sprom->fem.ghz2.pdet_range;
++	int c;
++
++	if (pdet_range != 5)
++		return;
++
++	for (c = 0; c < 3; c++) {
++		b43_httab_write(dev, B43_HTTAB16(8, 0x0b + c * 0x10),
++				vmid_pdet5[b][c]);
++		b43_httab_write(dev, B43_HTTAB16(8, 0x0f + c * 0x10),
++				gain_pdet5[b][c]);
++	}
++}
++
++/* Measure idle TSSI and program closed-loop power control for the current
++ * channel; the PA parameters and idle TSSI are band specific.
++ */
++/**************************************************
++ * TX I/Q and LO calibration
++ **************************************************/
++
++static const u16 b43_phy_ht_radio_core[3] = { R2059_C1, R2059_C2, R2059_C3 };
++
++static int modparam_htphy_txcal = 1;
++module_param_named(htphy_txcal, modparam_htphy_txcal, int, 0644);
++MODULE_PARM_DESC(htphy_txcal, "HT-PHY TX I/Q and LO calibration on channel switch (default on)");
++
++struct b43_phy_ht_txcal_save {
++	u16 classifier;
++	u16 clip[3];
++	u16 bbcfg;
++	u16 radio[3][8];
++	u16 afe_ctl[3], afe_over[3];
++	u16 afectl_tab[3];
++	u16 rf_ctl_int[3], rf_ctl_over[3];
++	u16 gain[3], bbmult[3];
++};
++
++/* TX calibration radio registers in R2059 core space, in save order. With
++ * the 2057 names from N-PHY: SSI master, IQCAL VCM HG, IQCAL IDAC, TSSI VCM,
++ * SSI mux, TSSI A, TSSI G, TSSI misc1.
++ */
++static const u16 b43_phy_ht_txcal_radio_regs[8] = {
++	0x155, 0x156, 0x157, 0x158, 0x159, 0x15a, 0x15b, 0x15c,
++};
++
++static void b43_phy_ht_txcal_setup(struct b43_wldev *dev,
++				   struct b43_phy_ht_txcal_save *s)
++{
++	static const u16 radio_core[3] = { R2059_C1, R2059_C2, R2059_C3 };
++	static const u16 val_2g[8] = { 0x06, 0x43, 0x55, 0x00, 0x06, 0x00, 0x31, 0x00 };
++	static const u16 val_5g[8] = { 0x0a, 0x43, 0x55, 0x00, 0x04, 0x31, 0x00, 0x00 };
++	const u16 *val = b43_current_band(dev->wl) == NL80211_BAND_5GHZ ?
++			 val_5g : val_2g;
++	/* Same gain index the proprietary driver calibrates at */
++	u32 g = b43_httab_read(dev, B43_HTTAB32(26, 0xC0 + 0x19));
++	int c, i;
++
++	/* Stay in carrier search: no OFDM receive, clip never triggers */
++	s->classifier = b43_phy_ht_classifier(dev, 0, 0);
++	b43_phy_ht_classifier(dev, B43_PHY_HT_CLASS_CTL_OFDM_EN, 0);
++	b43_phy_ht_read_clip_detection(dev, s->clip);
++	for (c = 0; c < 3; c++)
++		b43_phy_write(dev, B43_PHY_HT_C1_CLIP1THRES + c * 0x40, 0xFFFF);
++	b43_phy_ht_reset_cca(dev);
++
++	for (c = 0; c < 3; c++)
++		for (i = 0; i < 8; i++) {
++			u16 r = radio_core[c] | b43_phy_ht_txcal_radio_regs[i];
++
++			s->radio[c][i] = b43_radio_read(dev, r);
++			b43_radio_write(dev, r, val[i]);
++		}
++
++	for (c = 0; c < 3; c++) {
++		u16 afe_ctl = B43_PHY_HT_AFE_C1 + c * 4;
++		u16 afe_over = B43_PHY_HT_AFE_C1_OVER + c * 4;
++		u16 rf_int = B43_PHY_EXTG(0x04c + c * 0x20);
++		u16 rf_over = B43_PHY_EXTG(0x040 + c * 0x20);
++
++		s->afe_ctl[c] = b43_phy_read(dev, afe_ctl);
++		s->afe_over[c] = b43_phy_read(dev, afe_over);
++		b43_phy_maskset(dev, afe_ctl, 0xF0FF, 0x0A00);
++		b43_phy_set(dev, afe_over, 0x0600);
++
++		s->afectl_tab[c] = b43_httab_read(dev, B43_HTTAB16(8, 0x03 + c * 0x10));
++		b43_httab_write(dev, B43_HTTAB16(8, 0x03 + c * 0x10), 0);
++
++		s->rf_ctl_int[c] = b43_phy_read(dev, rf_int);
++		s->rf_ctl_over[c] = b43_phy_read(dev, rf_over);
++		b43_phy_write(dev, rf_int, 0x1480);
++		b43_phy_set(dev, rf_over, 0x0002);
++	}
++
++	s->bbcfg = b43_phy_read(dev, B43_PHY_HT_BBCFG);
++	b43_phy_mask(dev, B43_PHY_HT_BBCFG, ~B43_PHY_HT_BBCFG_RSTRX & 0xFFFF);
++
++	for (c = 0; c < 3; c++) {
++		s->gain[c] = b43_httab_read(dev, B43_HTTAB16(7, 0x110 + c));
++		s->bbmult[c] = b43_httab_read(dev, B43_HTTAB16(13, 0x63 + c * 4));
++		b43_httab_write(dev, B43_HTTAB16(7, 0x110 + c), g >> 16);
++		b43_httab_write(dev, B43_HTTAB16(13, 0x63 + c * 4), g & 0xFF);
++		b43_httab_write(dev, B43_HTTAB16(13, 0x73 + c * 4), g & 0xFF);
++	}
++}
++
++static void b43_phy_ht_txcal_cleanup(struct b43_wldev *dev,
++				     struct b43_phy_ht_txcal_save *s)
++{
++	static const u16 radio_core[3] = { R2059_C1, R2059_C2, R2059_C3 };
++	int c, i;
++
++	for (c = 0; c < 3; c++) {
++		b43_httab_write(dev, B43_HTTAB16(7, 0x110 + c), s->gain[c]);
++		b43_httab_write(dev, B43_HTTAB16(13, 0x63 + c * 4), s->bbmult[c]);
++		b43_httab_write(dev, B43_HTTAB16(13, 0x73 + c * 4), s->bbmult[c]);
++	}
++	for (c = 0; c < 3; c++) {
++		b43_phy_write(dev, B43_PHY_HT_AFE_C1 + c * 4, s->afe_ctl[c]);
++		b43_phy_write(dev, B43_PHY_HT_AFE_C1_OVER + c * 4, s->afe_over[c]);
++		b43_httab_write(dev, B43_HTTAB16(8, 0x03 + c * 0x10), s->afectl_tab[c]);
++		b43_phy_write(dev, B43_PHY_EXTG(0x04c + c * 0x20), s->rf_ctl_int[c]);
++		b43_phy_write(dev, B43_PHY_EXTG(0x040 + c * 0x20), s->rf_ctl_over[c]);
++	}
++	b43_phy_write(dev, B43_PHY_HT_BBCFG, s->bbcfg);
++	b43_phy_ht_reset_cca(dev);
++
++	for (c = 0; c < 3; c++)
++		for (i = 0; i < 8; i++)
++			b43_radio_write(dev, radio_core[c] | b43_phy_ht_txcal_radio_regs[i],
++					s->radio[c][i]);
++
++	b43_phy_ht_classifier(dev, 0x7, s->classifier);
++	for (c = 0; c < 3; c++)
++		b43_phy_write(dev, B43_PHY_HT_C1_CLIP1THRES + c * 0x40, s->clip[c]);
++	b43_phy_ht_reset_cca(dev);
++}
++
++/* Loads a full-scale (250) tone at 1/8 of the sample rate, I in bits 10-19
++ * and Q in bits 0-9, the waveform the proprietary driver plays for TX
++ * calibration (2.5 MHz at 20 MHz bandwidth).
++ */
++static u16 b43_phy_ht_load_cal_tone(struct b43_wldev *dev)
++{
++	static const u32 tone[8] = {
++		0x3e800, 0x2c4b1, 0x000fa, 0xd3cb1,
++		0xc1800, 0xd3f4f, 0x00306, 0x2c74f,
++	};
++	u16 len = 20 << 3;
++	int i;
++
++	for (i = 0; i < len; i += ARRAY_SIZE(tone))
++		b43_httab_write_bulk(dev, B43_HTTAB32(17, i), ARRAY_SIZE(tone), tone);
++	return len;
++}
++
++/* Hardware-assisted TX I/Q imbalance and LO leakage calibration: the engine
++ * plays a tone through each core's transmitter, measures it through the
++ * internal loopback and searches the correction coefficients. Sequence and
++ * constants follow what the proprietary driver does on every channel; the
++ * structure is the same as N-PHY rev3+ (b43_nphy_cal_tx_iq_lo).
++ */
++/* Apply a core's I/Q (a, b) and coarse LO coefficients, both copies as the
++ * proprietary driver does, and put the full working set (incl. fine LO) back.
++ */
++static void b43_phy_ht_txcal_apply(struct b43_wldev *dev, int c, const u16 *coef)
++{
++	int i;
++
++	for (i = 0; i < 6; i++)
++		if (i != 2)
++			b43_httab_write(dev, B43_HTTAB16(13, 0x40 + c * 8 + i), coef[i]);
++	for (i = 0; i < 2; i++) {
++		u16 o = (i ? 0x70 : 0x60) + c * 4;
++
++		b43_httab_write(dev, B43_HTTAB16(13, o + 0), coef[0]);
++		b43_httab_write(dev, B43_HTTAB16(13, o + 1), coef[1]);
++		b43_httab_write(dev, B43_HTTAB16(13, o + 2), coef[3]);
++	}
++}
++
++/* Returns false if the result looks bogus: the coarse LO coefficients
++ * (one signed byte each for I and Q) are within +-2 on every good run, while
++ * a bad run (seen once after module load) gives values in the tens.
++ */
++static bool b43_phy_ht_cal_tx_iq_lo_once(struct b43_wldev *dev)
++{
++	/* type 4 / 3: LO fine, 0: I/Q, 2: LO coarse; low byte: search params */
++	static const u16 cmds[] = { 0x0434, 0x0334, 0x0084, 0x0267, 0x0056, 0x0234 };
++	/* Ladder percentages (N-PHY ladder_lo/ladder_iq), g_env in low byte */
++	static const u8 lo_pct[18] = { 3, 4, 6, 9, 13, 18, 25, 25, 25, 25, 25, 25, 25, 25, 35, 50, 71, 100 };
++	static const u8 lo_env[18] = { 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7 };
++	static const u8 iq_pct[18] = { 3, 4, 6, 9, 13, 18, 25, 35, 50, 71, 100, 100, 100, 100, 100, 100, 100, 100 };
++	static const u8 iq_env[18] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7 };
++	struct ieee80211_channel *chan = dev->phy.chandef->chan;
++	struct b43_phy_ht_txcal_save s;
++	u16 coef[3][6];
++	bool ok = true;
++	int c, i, n;
++	u16 len, bbmult;
++	ktime_t t0 = ktime_get();
++
++	b43_phy_ht_txcal_setup(dev, &s);
++	bbmult = b43_httab_read(dev, B43_HTTAB16(13, 0x63));
++
++	b43_phy_write(dev, B43_PHY_HT_IQLOCAL_CMDGCTL, 0x8AD9);
++	for (c = 0; c < 3; c++)
++		for (i = 0; i < 6; i++)
++			if (i != 2)
++				b43_httab_write(dev, B43_HTTAB16(13, 0x40 + c * 8 + i), 0);
++
++	len = b43_phy_ht_load_cal_tone(dev);
++	b43_phy_ht_reset_cca(dev);
++	b43_phy_ht_run_samples(dev, len, 0xFFFF, 0, true);
++
++	for (c = 0; c < 3; c++) {
++		u16 base = 0x40 + c * 8, res = 0x80 + c * 7;
++
++		for (i = 0; i < 18; i++) {
++			b43_httab_write(dev, B43_HTTAB16(13, i),
++					((lo_pct[i] * bbmult / 100) & 0xFF) << 8 | lo_env[i]);
++			b43_httab_write(dev, B43_HTTAB16(13, 0x20 + i),
++					((iq_pct[i] * bbmult / 100) & 0xFF) << 8 | iq_env[i]);
++		}
++
++		for (n = 0; n < ARRAY_SIZE(cmds); n++) {
++			u16 type = (cmds[n] >> 8) & 0xF;
++
++			b43_phy_write(dev, B43_PHY_HT_IQLOCAL_CMDNNUM, 0x7987);
++			if (type == 3 || type == 4)
++				b43_httab_write(dev, B43_HTTAB16(13, base + 3), 0);
++			if (type == 4)
++				b43_httab_write(dev, B43_HTTAB16(13, base + 4), 0);
++
++			b43_phy_write(dev, B43_PHY_HT_IQLOCAL_CMD,
++				      B43_PHY_HT_IQLOCAL_CMD_EN | (c << 12) | cmds[n]);
++			for (i = 0; i < 2000; i++) {
++				if (!(b43_phy_read(dev, B43_PHY_HT_IQLOCAL_CMD) &
++				      B43_PHY_HT_IQLOCAL_CMD_EN))
++					break;
++				udelay(10);
++			}
++			if (i == 2000)
++				b43warn(dev->wl, "TX IQ/LO cal timeout (core %d, cmd 0x%04x)\n",
++					c, cmds[n]);
++
++			switch (type) {
++			case 0:
++				for (i = 0; i < 2; i++)
++					b43_httab_write(dev, B43_HTTAB16(13, base + i),
++						b43_httab_read(dev, B43_HTTAB16(13, res + i)));
++				break;
++			default: /* 2, 3, 4 -> coefficient 3, 4, 5 */
++				i = type + 1;
++				b43_httab_write(dev, B43_HTTAB16(13, base + i),
++					b43_httab_read(dev, B43_HTTAB16(13, res + i)));
++				break;
++			}
++		}
++	}
++
++	for (c = 0; c < 3; c++) {
++		for (i = 0; i < 6; i++)
++			coef[c][i] = b43_httab_read(dev, B43_HTTAB16(13, 0x40 + c * 8 + i));
++		b43_phy_ht_txcal_apply(dev, c, coef[c]);
++	}
++
++	b43_phy_ht_stop_playback(dev);
++	b43_phy_ht_reset_cca(dev);
++	b43_phy_write(dev, B43_PHY_HT_IQLOCAL_CMDGCTL, 0);
++	b43_phy_ht_txcal_cleanup(dev, &s);
++
++	for (c = 0; c < 3; c++)
++		if (abs((s8)(coef[c][3] & 0xFF)) > 2 || abs((s8)(coef[c][3] >> 8)) > 2)
++			ok = false;
++
++	b43dbg(dev->wl, "TX IQ/LO cal %u MHz (%lld us)%s: c1 %04x %04x %04x c2 %04x %04x %04x c3 %04x %04x %04x\n",
++	       chan->center_freq, ktime_us_delta(ktime_get(), t0), ok ? "" : " bogus",
++	       coef[0][0], coef[0][1], coef[0][3], coef[1][0], coef[1][1], coef[1][3],
++	       coef[2][0], coef[2][1], coef[2][3]);
++	return ok;
++}
++
++/**************************************************
++ * RX I/Q calibration
++ **************************************************/
++
++static int modparam_htphy_rxcal = 1;
++module_param_named(htphy_rxcal, modparam_htphy_rxcal, int, 0644);
++MODULE_PARM_DESC(htphy_rxcal, "HT-PHY RX I/Q calibration on channel switch (default on)");
++
++struct b43_phy_ht_iq_est {
++	s32 iq;		/* I * Q accumulator */
++	u32 p0, p1;	/* the two power accumulators */
++};
++
++/* Per-core estimator results: I*Q, then two powers, 32 bits each */
++static const u16 b43_phy_ht_iqest_base[3] = { 0x12C, 0x134, 0x13A };
++
++static u32 b43_phy_ht_read32(struct b43_wldev *dev, u16 reg)
++{
++	u32 hi = b43_phy_read(dev, reg + 1);
++
++	return (hi << 16) | b43_phy_read(dev, reg);
++}
++
++static bool b43_phy_ht_rx_iq_est(struct b43_wldev *dev,
++				 struct b43_phy_ht_iq_est *est, u16 samps)
++{
++	int c, i;
++
++	b43_phy_write(dev, B43_PHY_HT_IQEST_SAMCNT, samps);
++	b43_phy_maskset(dev, B43_PHY_HT_IQEST_WT, 0xFF00, 32);
++	b43_phy_mask(dev, B43_PHY_HT_IQEST_CMD, ~B43_PHY_HT_IQEST_CMD_MODE);
++	b43_phy_set(dev, B43_PHY_HT_IQEST_CMD, B43_PHY_HT_IQEST_CMD_START);
++
++	for (i = 0; i < 1000; i++) {
++		if (!(b43_phy_read(dev, B43_PHY_HT_IQEST_CMD) &
++		      B43_PHY_HT_IQEST_CMD_START))
++			break;
++		udelay(10);
++	}
++	if (i == 1000) {
++		memset(est, 0, 3 * sizeof(*est));
++		return false;
++	}
++	for (c = 0; c < 3; c++) {
++		u16 b = b43_phy_ht_iqest_base[c];
++
++		est[c].iq = b43_phy_ht_read32(dev, b);
++		est[c].p0 = b43_phy_ht_read32(dev, b + 2);
++		est[c].p1 = b43_phy_ht_read32(dev, b + 4);
++	}
++	return true;
++}
++
++/* RX gain steps for the loopback level search, from brcmsmac's N-PHY tables
++ * (nphy_ipa_rxcal_gaintbl_5GHz and _2GHz_rev7, the ones the proprietary
++ * driver's steps match); a TX power index >= 0 lowers the test signal
++ * instead of the fixed calibration gain.
++ */
++struct b43_phy_ht_rxcal_gain {
++	u8 fine, biq0, lna2, lna1;
++	s8 txidx;
++};
++
++static const struct b43_phy_ht_rxcal_gain b43_phy_ht_rxcal_gain_2g[] = {
++	{ 0, 0, 0, 0, 10 },
++	{ 0, 0, 1, 0, 10 },
++	{ 0, 1, 2, 0, 10 },
++	{ 0, 1, 3, 0, 10 },
++	{ 0, 4, 3, 0, 10 },
++	{ 0, 6, 3, 0, 10 },
++};
++
++static const struct b43_phy_ht_rxcal_gain b43_phy_ht_rxcal_gain_5g[] = {
++	{ 0, 0, 0, 0, 100 },
++	{ 0, 0, 0, 0, 50 },
++	{ 0, 0, 0, 0, -1 },
++	{ 0, 0, 3, 0, -1 },
++	{ 0, 3, 3, 0, -1 },
++	{ 2, 3, 3, 0, -1 },
++};
++
++/* 2 MHz tone, amplitude 181, I in bits 10-19 and Q in bits 0-9: the
++ * waveform the proprietary driver loads for RX calibration.
++ */
++static const u32 b43_phy_ht_rxcal_samples[10] = {
++	0x2d400, 0x2486a, 0x0e0ac, 0xf20ac, 0xdb86a,
++	0xd2c00, 0xdbb96, 0xf2354, 0x0e354, 0x24b96,
++};
++
++static void b43_phy_ht_rxcal_tone(struct b43_wldev *dev, int c,
++				  const struct b43_phy_ht_rxcal_gain *g,
++				  u8 fine, u16 txgain)
++{
++	bool ghz5 = b43_current_band(dev->wl) == NL80211_BAND_5GHZ;
++	u16 len = ghz5 ? 320 : 160;
++	int i;
++
++	/* RX gain override: mixer/TIA (4 on 5 GHz, 3 on 2.4 GHz), LNAs; then
++	 * the baseband filters
++	 */
++	b43_phy_write(dev, B43_PHY_EXTG(0x045 + c * 0x20),
++		      ((ghz5 ? 4 : 3) << 4) | (g->lna2 << 2) | g->lna1);
++	b43_phy_write(dev, B43_PHY_EXTG(0x047 + c * 0x20), (fine << 4) | g->biq0);
++	b43_phy_set(dev, B43_PHY_EXTG(0x040 + c * 0x20), 0x3800);
++
++	for (i = 0; i < 3; i++) {
++		u16 gain = txgain;
++
++		if (g->txidx >= 0) {
++			u32 e = b43_httab_read(dev, B43_HTTAB32(26, 0xC0 + g->txidx));
++
++			gain = e >> 16;
++			b43_httab_write(dev, B43_HTTAB8(13, 0x63 + i * 4), e & 0xFF);
++			b43_httab_write(dev, B43_HTTAB8(13, 0x73 + i * 4), e & 0xFF);
++		}
++		b43_httab_write(dev, B43_HTTAB16(7, 0x110 + i), gain);
++	}
++
++	for (i = 0; i < len; i += ARRAY_SIZE(b43_phy_ht_rxcal_samples))
++		b43_httab_write_bulk(dev, B43_HTTAB32(17, i),
++				     ARRAY_SIZE(b43_phy_ht_rxcal_samples),
++				     b43_phy_ht_rxcal_samples);
++	b43_phy_ht_reset_cca(dev);
++	b43_phy_ht_run_samples(dev, len, 0xFFFF, 0, false);
++}
++
++/* Loopback level search, as N-PHY rev5+ (wlc_phy_rxcal_gainctrl_nphy_rev5):
++ * step the RX gain until the tone power crosses 10000, take the step below
++ * and trim the filter gain to about 2^13.
++ */
++static void b43_phy_ht_rxcal_gainctrl(struct b43_wldev *dev, int c, u16 txgain)
++{
++	bool ghz5 = b43_current_band(dev->wl) == NL80211_BAND_5GHZ;
++	const struct b43_phy_ht_rxcal_gain *tbl =
++		ghz5 ? b43_phy_ht_rxcal_gain_5g : b43_phy_ht_rxcal_gain_2g;
++	const int max = 5;
++	struct b43_phy_ht_iq_est est[3];
++	enum { INIT, UP, DOWN } dirn = INIT;
++	int idx = 3, prev = 3, optim = 3, fine;
++	u32 pwr, prev_pwr = 0, optim_pwr = 0;
++	bool done = false;
++
++	do {
++		b43_phy_ht_rxcal_tone(dev, c, &tbl[idx], tbl[idx].fine, txgain);
++		b43_phy_ht_rx_iq_est(dev, est, 1024);
++		pwr = DIV_ROUND_CLOSEST(est[c].p0, 1024) +
++		      DIV_ROUND_CLOSEST(est[c].p1, 1024);
++		b43_phy_ht_stop_playback(dev);
++
++		switch (dirn) {
++		case INIT:
++			dirn = pwr > 10000 ? DOWN : UP;
++			prev = idx;
++			idx += dirn == DOWN ? -1 : 1;
++			break;
++		case UP:
++			if (pwr > 10000) {
++				done = true;
++				optim_pwr = prev_pwr;
++				optim = prev;
++			} else {
++				prev = idx++;
++			}
++			break;
++		case DOWN:
++			if (pwr > 10000) {
++				prev = idx--;
++			} else {
++				done = true;
++				optim_pwr = pwr;
++				optim = idx;
++			}
++			break;
++		}
++		if (!done && (idx < 0 || idx > max)) {
++			done = true;
++			optim_pwr = pwr;
++			optim = prev;
++		} else {
++			prev_pwr = pwr;
++		}
++	} while (!done);
++
++	fine = tbl[optim].fine + 13 - fls(optim_pwr);
++	if (fine + tbl[optim].biq0 > 10)
++		fine = 10 - tbl[optim].biq0;
++	fine = max(fine, 0);
++	b43_phy_ht_rxcal_tone(dev, c, &tbl[optim], fine, txgain);
++}
++
++/* Compensation from the I/Q estimate, as N-PHY's CalcRxIqComp in 64-bit
++ * arithmetic, but with the two power accumulators in the opposite roles and
++ * the square root rounded up: this reproduces the proprietary driver's
++ * coefficients bit for bit from the estimates it read (both bands). Measured on receiver
++ * noise (no tone, so only the receiver's own imbalance), this ordering
++ * balances the I/Q power (core 2: -20% -> +2%) while N-PHY's doubles the
++ * error; in the loopback the TX path flips the sign of what the tone shows.
++ */
++static bool b43_phy_ht_rxcal_comp(const struct b43_phy_ht_iq_est *e,
++				  u16 *a_out, u16 *b_out)
++{
++	u64 ii = e->p1, qq = e->p0, x, r;
++	s64 a;
++
++	if (ii + qq < 2 || !ii)
++		return false;
++	a = div64_s64(-(s64)e->iq * 2048 + (s64)ii, 2 * (s64)ii);
++	x = div64_u64(qq << 20, ii);
++	if (x < a * a)
++		return false;
++	x -= a * a;
++	r = int_sqrt64(x);
++	if (x > r * r)
++		r++;
++	*a_out = (u16)a & 0x3FF;
++	*b_out = (u16)((s32)r - 1024) & 0x3FF;
++	return true;
++}
++
++/* Signed 10-bit field to int */
++static int b43_phy_ht_s10(u16 v)
++{
++	return (v & 0x200) ? (int)v - 0x400 : v;
++}
++
++static void b43_phy_ht_cal_rx_iq(struct b43_wldev *dev)
++{
++	static const u16 radio_core[3] = { R2059_C1, R2059_C2, R2059_C3 };
++	/* TX->RX coupler power-up/attenuation (2G pair, 5G pair; the 2057
++	 * TXRXCOUPLE registers), then three loopback path registers
++	 */
++	static const u16 radio_regs[9] = {
++		0x15d, 0x15e, 0x15f, 0x160, 0x172, 0x173, 0x174, 0x09b, 0x0a6,
++	};
++	static const u8 rf_regs[9] = {
++		0x40, 0x42, 0x43, 0x44, 0x45, 0x47, 0x49, 0x4a, 0x4c,
++	};
++	struct ieee80211_channel *chan = dev->phy.chandef->chan;
++	struct b43_phy_ht_iq_est est[3];
++	u16 classifier, clip[3], bbcfg, gain_save[3], bbmult[3], txgain, rfseqca;
++	u16 radio[9], rf[9], afe_ctl, afe_over, r297;
++	u16 a[3] = { }, b[3] = { };
++	int c, i;
++	ktime_t t0 = ktime_get();
++
++	classifier = b43_phy_ht_classifier(dev, 0, 0);
++	b43_phy_ht_classifier(dev, B43_PHY_HT_CLASS_CTL_OFDM_EN, 0);
++	b43_phy_ht_read_clip_detection(dev, clip);
++	for (c = 0; c < 3; c++)
++		b43_phy_write(dev, B43_PHY_HT_C1_CLIP1THRES + c * 0x40, 0xFFFF);
++	b43_phy_ht_reset_cca(dev);
++
++	for (c = 0; c < 3; c++) {
++		b43_phy_write(dev, B43_PHY_HT_RXIQ_COMP_A(c), 0);
++		b43_phy_write(dev, B43_PHY_HT_RXIQ_COMP_B(c), 0);
++	}
++	bbcfg = b43_phy_read(dev, B43_PHY_HT_BBCFG);
++	b43_phy_mask(dev, B43_PHY_HT_BBCFG, ~B43_PHY_HT_BBCFG_RSTRX & 0xFFFF);
++	for (c = 0; c < 3; c++) {
++		gain_save[c] = b43_httab_read(dev, B43_HTTAB16(7, 0x110 + c));
++		bbmult[c] = b43_httab_read(dev, B43_HTTAB8(13, 0x63 + c * 4));
++	}
++	/* Full TX gain but for the PA gain bits, as N-PHY's 0x8ff0 | gmval */
++	txgain = ((b43_httab_read(dev, B43_HTTAB32(26, 0xC0 + 0x32)) >> 16) & 0x7000) | 0x0FF8;
++
++	for (c = 0; c < 3; c++) {
++		u16 afe_ctl_reg = B43_PHY_HT_AFE_C1 + c * 4;
++		u16 afe_over_reg = B43_PHY_HT_AFE_C1_OVER + c * 4;
++		u16 rf_base = 0x040 + c * 0x20;
++		u16 r297_reg = 0x297 + c * 4;
++
++		/* PHY: transmit on this core only, AFE and RF overrides for
++		 * the internal TX->RX loopback
++		 */
++		afe_ctl = b43_phy_read(dev, afe_ctl_reg);
++		afe_over = b43_phy_read(dev, afe_over_reg);
++		b43_phy_mask(dev, afe_ctl_reg, ~0x0004);
++		b43_phy_set(dev, afe_over_reg, 0x0044);
++		rfseqca = b43_phy_read(dev, B43_PHY_EXTG(0x001));
++		b43_phy_mask(dev, B43_PHY_EXTG(0x001), 0x0FFF);
++		b43_phy_maskset(dev, B43_PHY_EXTG(0x001), ~0x000F, 1 << c);
++		for (i = 0; i < ARRAY_SIZE(rf_regs); i++)
++			rf[i] = b43_phy_read(dev, B43_PHY_EXTG(rf_base + rf_regs[i] - 0x40));
++		b43_phy_write(dev, B43_PHY_EXTG(rf_base + 0x0c), 0x1440);
++		b43_phy_set(dev, B43_PHY_EXTG(rf_base + 0x00), 0x0102);
++		b43_phy_set(dev, B43_PHY_EXTG(rf_base + 0x09),
++			    b43_current_band(dev->wl) == NL80211_BAND_5GHZ ?
++			    0x0420 : 0x0400);
++		b43_phy_set(dev, B43_PHY_EXTG(rf_base + 0x02), 0x00E4);
++		b43_phy_set(dev, B43_PHY_EXTG(rf_base + 0x0a), 0x0009);
++		b43_phy_set(dev, B43_PHY_EXTG(rf_base + 0x03), 0x0009);
++		r297 = b43_phy_read(dev, r297_reg);
++		b43_phy_mask(dev, r297_reg, ~0x0001);
++
++		/* Radio: couple the TX output into the receiver */
++		for (i = 0; i < ARRAY_SIZE(radio_regs); i++)
++			radio[i] = b43_radio_read(dev, radio_core[c] | radio_regs[i]);
++		if (b43_current_band(dev->wl) == NL80211_BAND_5GHZ) {
++			b43_radio_write(dev, radio_core[c] | 0x160, 0x03);
++			b43_radio_write(dev, radio_core[c] | 0x15f, 0x0f);
++		} else {
++			b43_radio_write(dev, radio_core[c] | 0x15e, 0x03);
++			b43_radio_write(dev, radio_core[c] | 0x15d, 0x7f);
++		}
++		b43_radio_mask(dev, radio_core[c] | 0x172, ~0x02);
++		b43_radio_write(dev, radio_core[c] | 0x173, 0x27);
++		b43_radio_write(dev, radio_core[c] | 0x174, 0x27);
++		b43_radio_write(dev, radio_core[c] | 0x09b, 0x24);
++		b43_radio_write(dev, radio_core[c] | 0x0a6, 0x02);
++
++		b43_phy_ht_rxcal_gainctrl(dev, c, txgain);
++		if (b43_phy_ht_rx_iq_est(dev, est, 0x4000) &&
++		    b43_phy_ht_rxcal_comp(&est[c], &a[c], &b[c])) {
++			b43_phy_write(dev, B43_PHY_HT_RXIQ_COMP_A(c), a[c]);
++			b43_phy_write(dev, B43_PHY_HT_RXIQ_COMP_B(c), b[c]);
++		}
++		b43_phy_ht_stop_playback(dev);
++
++		for (i = 0; i < ARRAY_SIZE(radio_regs); i++)
++			b43_radio_write(dev, radio_core[c] | radio_regs[i], radio[i]);
++		b43_phy_write(dev, afe_ctl_reg, afe_ctl);
++		b43_phy_write(dev, afe_over_reg, afe_over);
++		b43_phy_write(dev, B43_PHY_EXTG(0x001), rfseqca);
++		for (i = 0; i < ARRAY_SIZE(rf_regs); i++)
++			b43_phy_write(dev, B43_PHY_EXTG(rf_base + rf_regs[i] - 0x40), rf[i]);
++		b43_phy_write(dev, r297_reg, r297);
++		b43_phy_ht_force_rf_sequence(dev, B43_PHY_HT_RF_SEQ_TRIG_RST2RX);
++	}
++
++	for (c = 0; c < 3; c++) {
++		b43_httab_write(dev, B43_HTTAB16(7, 0x110 + c), gain_save[c]);
++		b43_httab_write(dev, B43_HTTAB8(13, 0x63 + c * 4), bbmult[c]);
++		b43_httab_write(dev, B43_HTTAB8(13, 0x73 + c * 4), bbmult[c]);
++	}
++	b43_phy_write(dev, B43_PHY_HT_BBCFG, bbcfg);
++	b43_phy_ht_reset_cca(dev);
++	b43_phy_ht_classifier(dev, 0x7, classifier);
++	for (c = 0; c < 3; c++)
++		b43_phy_write(dev, B43_PHY_HT_C1_CLIP1THRES + c * 0x40, clip[c]);
++	b43_phy_ht_reset_cca(dev);
++
++	b43dbg(dev->wl, "RX IQ cal %u MHz (%lld us): a/b %d/%d %d/%d %d/%d\n",
++	       chan->center_freq, ktime_us_delta(ktime_get(), t0),
++	       b43_phy_ht_s10(a[0]), b43_phy_ht_s10(b[0]),
++	       b43_phy_ht_s10(a[1]), b43_phy_ht_s10(b[1]),
++	       b43_phy_ht_s10(a[2]), b43_phy_ht_s10(b[2]));
++}
++
++/* What the calibration results are cached for: the tuned frequency and the
++ * bandwidth (which changes the sample rate)
++ */
++static u16 b43_phy_ht_cal_key(struct b43_wldev *dev)
++{
++	const struct b43_phy *phy = &dev->phy;
++
++	if (phy->bw40)
++		return phy->chandef->center_freq1 | 0x8000;
++	return phy->chandef->chan->center_freq;
++}
++
++/* associated: the AP accepted our frames, so transmitting the calibration
++ * tones is fine even where the channel is still flagged passive-only
++ */
++static void b43_phy_ht_cal_tx_iq_lo(struct b43_wldev *dev, bool associated)
++{
++	struct ieee80211_channel *chan = dev->phy.chandef->chan;
++	struct b43_phy_ht *phy_ht = dev->phy.ht;
++	int c, i;
++
++	if (!modparam_htphy_txcal || phy_ht->txcal_skip)
++		return;
++
++	/* Back on the channel calibrated last (e.g. after a scan, or a band
++	 * switch that re-initialised the PHY tables): reuse the result.
++	 */
++	if (phy_ht->cal.freq == b43_phy_ht_cal_key(dev)) {
++		for (c = 0; c < 3; c++) {
++			b43_phy_ht_txcal_apply(dev, c, phy_ht->cal.coef[c]);
++			for (i = 0; i < 4; i++)
++				b43_radio_write(dev, b43_phy_ht_radio_core[c] | (0x151 + i),
++						phy_ht->cal.loft[c][i]);
++		}
++		for (i = 0; i < 6; i++)
++			b43_phy_write(dev, B43_PHY_HT_RXIQ_COMP_A(0) + i,
++				      phy_ht->cal.rxcomp[i]);
++		return;
++	}
++	/* Takes ~40 ms and radiates a tone: not on every scan channel */
++	if (dev->wl->scanning)
++		return;
++	/* Never radiate on channels we may not initiate transmission on */
++	if (chan->flags & IEEE80211_CHAN_DISABLED)
++		return;
++	if (!associated &&
++	    chan->flags & (IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR))
++		return;
++
++	if (!b43_phy_ht_cal_tx_iq_lo_once(dev))
++		b43_phy_ht_cal_tx_iq_lo_once(dev);
++	if (modparam_htphy_rxcal)
++		b43_phy_ht_cal_rx_iq(dev);
++	else
++		for (i = 0; i < 6; i++)
++			b43_phy_write(dev, B43_PHY_HT_RXIQ_COMP_A(0) + i, 0);
++
++	phy_ht->cal.freq = b43_phy_ht_cal_key(dev);
++	for (c = 0; c < 3; c++) {
++		for (i = 0; i < 6; i++)
++			phy_ht->cal.coef[c][i] =
++				b43_httab_read(dev, B43_HTTAB16(13, 0x40 + c * 8 + i));
++		/* The engine leaves its LO trim in the radio (the 2057's
++		 * LOFT fine/coarse I/Q), which a radio re-init resets
++		 */
++		for (i = 0; i < 4; i++)
++			phy_ht->cal.loft[c][i] =
++				b43_radio_read(dev, b43_phy_ht_radio_core[c] | (0x151 + i));
++	}
++	for (i = 0; i < 6; i++)
++		phy_ht->cal.rxcomp[i] = b43_phy_read(dev, B43_PHY_HT_RXIQ_COMP_A(0) + i);
++}
++
++/* Calibrate now if it was skipped on the current channel: after a scan
++ * (which may end on the channel we connect to, or skip the return to it), or
++ * once associated on a channel we could not transmit on before.
++ */
++void b43_phy_ht_recal(struct b43_wldev *dev, bool associated)
++{
++	struct b43_phy_ht *phy_ht = dev->phy.ht;
++	bool saved_tx_pwr_ctl = phy_ht->tx_pwr_ctl;
++
++	if (!dev->phy.chandef)
++		return;
++	/* Calibrate at the fixed gain, as on a channel switch */
++	b43_phy_ht_tx_power_ctl(dev, false);
++	b43_phy_ht_cal_tx_iq_lo(dev, associated);
++	b43_phy_ht_tx_power_ctl(dev, saved_tx_pwr_ctl);
++}
++
++/* Redo the calibrations every 2 minutes, as the proprietary driver does
++ * (brcmsmac's N-PHY watchdog uses the same 120 s glacial timer): they drift
++ * with temperature. Costs ~80 ms off the air.
++ */
++static void b43_phy_ht_op_pwork_60sec(struct b43_wldev *dev)
++{
++	struct b43_phy_ht *phy_ht = dev->phy.ht;
++
++	if (++phy_ht->pwork_count < 2)
++		return;
++	phy_ht->pwork_count = 0;
++	if (!dev->phy.chandef || dev->wl->scanning)
++		return;
++	/* Only where we calibrated before, i.e. were allowed to transmit */
++	if (phy_ht->cal.freq != b43_phy_ht_cal_key(dev))
++		return;
++
++	b43_mac_suspend(dev);
++	phy_ht->cal.freq = 0;
++	b43_phy_ht_recal(dev, true);
++	b43_mac_enable(dev);
++}
++
++static void b43_phy_ht_tx_power_ctl_init(struct b43_wldev *dev, bool new_chan)
++{
++	struct b43_phy_ht *phy_ht = dev->phy.ht;
++	bool saved_tx_pwr_ctl = phy_ht->tx_pwr_ctl;
++	int i;
++
++	b43_phy_ht_tx_power_fix(dev);
++	b43_phy_ht_tx_power_ctl(dev, false);
++	/* Disabling saved the index learnt on the old channel; don't carry
++	 * it over, start from the setup's initial index instead.
++	 */
++	if (new_chan)
++		for (i = 0; i < 3; i++)
++			phy_ht->tx_pwr_idx[i] = B43_PHY_HT_TXPCTL_CMD_C1_INIT + 1;
++	b43_phy_ht_tx_power_ctl_idle_tssi(dev);
++	b43_phy_ht_tx_power_ctl_setup(dev);
++	b43_phy_ht_tssi_setup(dev);
++	if (new_chan)
++		b43_phy_ht_cal_tx_iq_lo(dev, false);
++	b43_phy_ht_tx_power_ctl(dev, saved_tx_pwr_ctl);
++}
++
+ static void b43_phy_ht_tx_power_ctl_setup(struct b43_wldev *dev)
+ {
+ 	struct b43_phy_ht *phy_ht = dev->phy.ht;
+@@ -628,6 +1516,9 @@
+ 	s16 a1[3], b0[3], b1[3];
+ 
+ 	u16 freq = dev->phy.chandef->chan->center_freq;
++	int max_power = dev->phy.chandef->chan->max_power;
++	int nchains, backoff, limit;
++	u16 init_idx;
+ 	int i, c;
+ 
+ 	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
+@@ -672,12 +1563,37 @@
+ 	/* TODO: Does it depend on sprom->fem.ghz2.tssipos? */
+ 	b43_phy_set(dev, B43_PHY_HT_TXPCTL_IDLE_TSSI, 0x4000);
+ 
++	/* The SPROM limit (Q5.2 dBm) applies to the whole transmission, but the
++	 * same frame goes out on every TX chain. Give each chain its share
++	 * (-4.75 dB for three, -3 dB for two), otherwise the PAs run ~5 dB
++	 * above the proprietary driver and 54M OFDM distorts on 5 GHz.
++	 * Also respect the regulatory and user limits like N-PHY does.
++	 */
++	nchains = hweight8(sprom->txchain & 0x7);
++	if (!nchains)
++		nchains = 3;
++	backoff = nchains == 3 ? 19 : nchains == 2 ? 12 : 0;
++	limit = 0x7f;
++	if (max_power > 0)
++		limit = min(limit, max_power * 4);
++	if (dev->phy.desired_txpower > 0)
++		limit = min(limit, dev->phy.desired_txpower * 4);
++	for (c = 0; c < 3; c++) {
++		int t = min_t(int, target[c], limit) - backoff;
++
++		target[c] = clamp(t, 0, 0x7f);
++	}
++
++	/* Starting gain index; the proprietary driver starts at 0x20 on
++	 * 5 GHz, where the gain table is ~6 dB hotter at low indices.
++	 */
++	init_idx = b43_current_band(dev->wl) == NL80211_BAND_5GHZ ? 0x20 : 0x19;
+ 	b43_phy_maskset(dev, B43_PHY_HT_TXPCTL_CMD_C1,
+-			~B43_PHY_HT_TXPCTL_CMD_C1_INIT, 0x19);
++			~B43_PHY_HT_TXPCTL_CMD_C1_INIT, init_idx);
+ 	b43_phy_maskset(dev, B43_PHY_HT_TXPCTL_CMD_C2,
+-			~B43_PHY_HT_TXPCTL_CMD_C2_INIT, 0x19);
++			~B43_PHY_HT_TXPCTL_CMD_C2_INIT, init_idx);
+ 	b43_phy_maskset(dev, B43_PHY_HT_TXPCTL_CMD_C3,
+-			~B43_PHY_HT_TXPCTL_CMD_C3_INIT, 0x19);
++			~B43_PHY_HT_TXPCTL_CMD_C3_INIT, init_idx);
+ 
+ 	b43_phy_set(dev, B43_PHY_HT_TXPCTL_IDLE_TSSI,
+ 		    B43_PHY_HT_TXPCTL_IDLE_TSSI_BINF);
+@@ -714,13 +1630,14 @@
+ 
+ 	for (c = 0; c < 3; c++) {
+ 		s32 num, den, pwr;
+-		u32 regval[64];
++		/* Must match the 16-bit table width used for the upload below */
++		u16 regval[64];
+ 
+ 		for (i = 0; i < 64; i++) {
+ 			num = 8 * (16 * b0[c] + b1[c] * i);
+ 			den = 32768 + a1[c] * i;
+ 			pwr = max((4 * num + den / 2) / den, -8);
+-			regval[i] = pwr;
++			regval[i] = (u16)pwr;
+ 		}
+ 		b43_httab_write_bulk(dev, B43_HTTAB16(26 + c, 0), 64, regval);
+ 	}
+@@ -796,6 +1713,11 @@
+ 			b43_phy_mask(dev, B43_PHY_HT_TEST, ~0x840);
+ 	}
+ 
++	/* The gain table is band specific; reload it before the fixed gain is
++	 * picked from it below.
++	 */
++	b43_phy_ht_tx_gain_table_upload(dev, new_channel->band);
++
+ 	if (1) /* TODO: On N it's for early devices only, what about HT? */
+ 		b43_phy_ht_tx_power_fix(dev);
+ 
+@@ -804,29 +1726,106 @@
+ 	b43_phy_write(dev, 0x017e, 0x3830);
+ }
+ 
++/* TX digital filter, 20 MHz path (N-PHY: TXF_20CO). The default is the
++ * N-PHY 40 MHz set, which the proprietary driver uses everywhere except on
++ * the 2.4 GHz band edge channels: there a sharper one.
++ */
++static const s16 b43_phy_ht_txf20_edge[15] = {
++	-307, 82, -389, 189, -1529, 938, 256, 511, 256, 102, -20, 102, 273,
++	-260, 273,
++};
++static const s16 b43_phy_ht_txf20_default[15] = {
++	-295, 200, -363, 142, -1391, 826, 151, 301, 151, 151, 301, 151, 602,
++	-752, 602,
++};
++
++/* Per channel and bandwidth settings, as the proprietary driver leaves
++ * them (it adapts the CRS thresholds to interference later; we don't).
++ */
++static void b43_phy_ht_bw_setup(struct b43_wldev *dev,
++				struct ieee80211_channel *channel, u16 freq)
++{
++	struct b43_phy *phy = &dev->phy;
++	bool g = channel->band == NL80211_BAND_2GHZ;
++	const s16 *txf;
++	u16 v;
++	int c, i;
++
++	/* Which half is primary (N-PHY rev 7 BPHY_BAND_SEL_UP20 and
++	 * PRIM_SEL_UP20, the same here). Cleared at 20 MHz too: bit 4 of
++	 * 0x0a0 comes out of reset set.
++	 */
++	b43_phy_maskset(dev, 0x0a0, ~0x0010, phy->ctl_upper ? 0x0010 : 0);
++	b43_phy_maskset(dev, 0x310, 0x7fff, phy->ctl_upper ? 0x8000 : 0);
++
++	/* CRS minimum power, it seems (the proprietary driver raises it
++	 * under interference). Replaces upstream's fixed 0x3e/0x40.
++	 */
++	if (phy->bw40)
++		v = 0x3c;
++	else if (!g && freq >= 5765)
++		v = 0x41;
++	else
++		v = 0x3f;
++	b43_phy_maskset(dev, 0x0280, 0xff00, v);
++	b43_phy_maskset(dev, 0x0283, 0xff00, v);
++
++	/* Also adapted to interference by the proprietary driver */
++	v = 0x140 | (g ? 0xd : phy->bw40 ? 0x18 : 0x19);
++	for (c = 0; c < 3; c++)
++		b43_phy_write(dev, B43_PHY_OFDM(0x24 + c * 0x40), v);
++
++	for (c = 0; c < 3; c++) {
++		b43_httab_write(dev, B43_HTTAB16(7, 0x14a + c * 0x10),
++				phy->bw40 ? 4 : 2);
++		b43_httab_write(dev, B43_HTTAB16(8, 0x04 + c * 0x10),
++				phy->bw40 ? 0xfc60 : 0xa840);
++		b43_httab_write(dev, B43_HTTAB16(8, 0x05 + c * 0x10),
++				phy->bw40 ? 0xc : 0x8);
++	}
++	b43_phy_write(dev, 0x02f2, 0x1c1c);
++	b43_phy_write(dev, 0x02f3, 0x001c);
++
++	txf = g && (channel->hw_value == 1 || channel->hw_value == 13) ?
++	      b43_phy_ht_txf20_edge : b43_phy_ht_txf20_default;
++	for (i = 0; i < 15; i++)
++		b43_phy_write(dev, 0x186 + i, txf[i]);
++}
++
+ static int b43_phy_ht_set_channel(struct b43_wldev *dev,
+ 				  struct ieee80211_channel *channel,
+ 				  enum nl80211_channel_type channel_type)
+ {
+ 	struct b43_phy *phy = &dev->phy;
++	/* 40 MHz wide the radio tunes to the centre of the pair */
++	u16 freq = phy->bw40 ? phy->chandef->center_freq1 :
++			       channel->center_freq;
+ 
+ 	const struct b43_phy_ht_channeltab_e_radio2059 *chent_r2059 = NULL;
+ 
+ 	if (phy->radio_ver == 0x2059) {
+-		chent_r2059 = b43_phy_ht_get_channeltab_e_r2059(dev,
+-							channel->center_freq);
++		chent_r2059 = b43_phy_ht_get_channeltab_e_r2059(dev, freq);
+ 		if (!chent_r2059)
+ 			return -ESRCH;
+ 	} else {
+ 		return -ESRCH;
+ 	}
+ 
+-	/* TODO: In case of N-PHY some bandwidth switching goes here */
+-
+ 	if (phy->radio_ver == 0x2059) {
+ 		b43_radio_2059_channel_setup(dev, chent_r2059);
+ 		b43_phy_ht_channel_setup(dev, &(chent_r2059->phy_regs),
+ 					 channel);
++		b43_phy_ht_tssi_band_setup(dev, channel->band);
++		b43_phy_ht_rx_gain_setup(dev, channel);
++		/* The bandwidth itself is the core's PHY clock, set by
++		 * b43_switch_band()
++		 */
++		b43_phy_ht_bw_setup(dev, channel, freq);
++		/* Upstream only sets power control up once, for the band
++		 * active at init. Redo it so 5 GHz gets its own idle TSSI and
++		 * PA parameters.
++		 */
++		b43_phy_ht_tx_power_ctl_init(dev, true);
+ 	} else {
+ 		return -ESRCH;
+ 	}
+@@ -854,9 +1853,19 @@
+ {
+ 	struct b43_phy *phy = &dev->phy;
+ 	struct b43_phy_ht *phy_ht = phy->ht;
++	struct b43_phy_ht_cal cal = phy_ht->cal;
+ 	int i;
+ 
+ 	memset(phy_ht, 0, sizeof(*phy_ht));
++	/* Keep the calibration cache over a chip re-init (ifup, controller
++	 * restart), as over a band switch: it re-initialises the radio just
++	 * the same. NetworkManager takes the interface down and up twice per
++	 * connection (MAC address changes); calibrating the default channel
++	 * each time made ifup 80 ms slower, enough for wpa_supplicant's scan
++	 * to hit the downed interface and stall the connection ~5 s.
++	 * Calibrations are redone every 2 minutes while associated.
++	 */
++	phy_ht->cal = cal;
+ 
+ 	phy_ht->tx_pwr_ctl = true;
+ 	for (i = 0; i < 3; i++)
+@@ -868,10 +1877,8 @@
+ 
+ static int b43_phy_ht_op_init(struct b43_wldev *dev)
+ {
+-	struct b43_phy_ht *phy_ht = dev->phy.ht;
+ 	u16 tmp;
+ 	u16 clip_state[3];
+-	bool saved_tx_pwr_ctl;
+ 
+ 	if (dev->dev->bus_type != B43_BUS_BCMA) {
+ 		b43err(dev->wl, "HT-PHY is supported only on BCMA bus!\n");
+@@ -954,7 +1961,11 @@
+ 	b43_httab_write_few(dev, B43_HTTAB16(40, 0x8), 4,
+ 			    0x09, 0x0e, 0x13, 0x18);
+ 
+-	b43_phy_maskset(dev, B43_PHY_OFDM(0x24), 0x3f, 0xd);
++	/* Upstream had the mask inverted and cleared bits 6-15 (the
++	 * proprietary driver leaves 0x140 there). Set per channel by
++	 * b43_phy_ht_bw_setup().
++	 */
++	b43_phy_maskset(dev, B43_PHY_OFDM(0x24), ~0x3f, 0xd);
+ 	b43_phy_maskset(dev, B43_PHY_OFDM(0x64), 0x3f, 0xd);
+ 	b43_phy_maskset(dev, B43_PHY_OFDM(0xa4), 0x3f, 0xd);
+ 
+@@ -992,16 +2003,9 @@
+ 	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ)
+ 		b43_phy_ht_bphy_init(dev);
+ 
+-	b43_httab_write_bulk(dev, B43_HTTAB32(0x1a, 0xc0),
+-			B43_HTTAB_1A_C0_LATE_SIZE, b43_httab_0x1a_0xc0_late);
++	b43_phy_ht_tx_gain_table_upload(dev, b43_current_band(dev->wl));
+ 
+-	saved_tx_pwr_ctl = phy_ht->tx_pwr_ctl;
+-	b43_phy_ht_tx_power_fix(dev);
+-	b43_phy_ht_tx_power_ctl(dev, false);
+-	b43_phy_ht_tx_power_ctl_idle_tssi(dev);
+-	b43_phy_ht_tx_power_ctl_setup(dev);
+-	b43_phy_ht_tssi_setup(dev);
+-	b43_phy_ht_tx_power_ctl(dev, saved_tx_pwr_ctl);
++	b43_phy_ht_tx_power_ctl_init(dev, false);
+ 
+ 	return 0;
+ }
+@@ -1031,7 +2035,14 @@
+ 		else
+ 			B43_WARN_ON(1);
+ 
++		/* b43_phy_init() unblocks before the PHY is initialised
++		 * (tables empty, overrides at reset values) and switches the
++		 * channel again right after; calibrating here yields garbage.
++		 * On a later unblock the coefficients are still in place.
++		 */
++		dev->phy.ht->txcal_skip = true;
+ 		b43_switch_channel(dev, dev->phy.channel);
++		dev->phy.ht->txcal_skip = false;
+ 	}
+ }
+ 
+@@ -1065,7 +2076,8 @@
+ 		if ((new_channel < 1) || (new_channel > 14))
+ 			return -EINVAL;
+ 	} else {
+-		return -EINVAL;
++		if ((new_channel < 36) || (new_channel > 165))
++			return -EINVAL;
+ 	}
+ 
+ 	return b43_phy_ht_set_channel(dev, channel, channel_type);
+@@ -1134,4 +2146,5 @@
+ 	.get_default_chan	= b43_phy_ht_op_get_default_chan,
+ 	.recalc_txpower		= b43_phy_ht_op_recalc_txpower,
+ 	.adjust_txpower		= b43_phy_ht_op_adjust_txpower,
++	.pwork_60sec		= b43_phy_ht_op_pwork_60sec,
+ };
+diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.h b/drivers/net/wireless/broadcom/b43/phy_ht.h
+--- a/drivers/net/wireless/broadcom/b43/phy_ht.h
++++ b/drivers/net/wireless/broadcom/b43/phy_ht.h
+@@ -17,6 +17,9 @@
+ #define  B43_PHY_HT_CLASS_CTL_CCK_EN		0x0001 /* CCK enable */
+ #define  B43_PHY_HT_CLASS_CTL_OFDM_EN		0x0002 /* OFDM enable */
+ #define  B43_PHY_HT_CLASS_CTL_WAITED_EN		0x0004 /* Waited enable */
++#define B43_PHY_HT_IQLOCAL_CMD			0x0C0	/* I/Q LO cal command */
++#define  B43_PHY_HT_IQLOCAL_CMD_EN		0x8000
++#define B43_PHY_HT_IQLOCAL_CMDNNUM		0x0C1	/* I/Q LO cal command N num */
+ #define B43_PHY_HT_IQLOCAL_CMDGCTL		0x0C2	/* I/Q LO cal command G control */
+ #define B43_PHY_HT_SAMP_CMD			0x0C3	/* Sample command */
+ #define  B43_PHY_HT_SAMP_CMD_STOP		0x0002	/* Stop */
+@@ -28,6 +31,13 @@
+ #define B43_PHY_HT_EST_PWR_C2			0x119
+ #define B43_PHY_HT_EST_PWR_C3			0x11A
+ #define B43_PHY_HT_TSSIMODE			0x122	/* TSSI mode */
++#define B43_PHY_HT_RXIQ_COMP_A(core)		(0x09A + (core) * 2) /* RX I/Q comp A */
++#define B43_PHY_HT_RXIQ_COMP_B(core)		(0x09B + (core) * 2) /* RX I/Q comp B */
++#define B43_PHY_HT_IQEST_CMD			0x129	/* I/Q estimate command */
++#define  B43_PHY_HT_IQEST_CMD_START		0x0001
++#define  B43_PHY_HT_IQEST_CMD_MODE		0x0002
++#define B43_PHY_HT_IQEST_WT			0x12A	/* I/Q estimate wait time */
++#define B43_PHY_HT_IQEST_SAMCNT			0x12B	/* I/Q estimate sample count */
+ #define  B43_PHY_HT_TSSIMODE_EN			0x0001	/* TSSI enable */
+ #define  B43_PHY_HT_TSSIMODE_PDEN		0x0002	/* Power det enable */
+ #define B43_PHY_HT_BW1				0x1CE
+@@ -124,6 +134,16 @@
+ };
+ 
+ 
++/* Last calibration results: TX I/Q LO (table 13 0x40 + 8 * core), LO trim
++ * the engine leaves in the radio, RX I/Q compensation
++ */
++struct b43_phy_ht_cal {
++	u16 freq;	/* b43_phy_ht_cal_key(), 0 = none */
++	u16 coef[3][6];
++	u16 loft[3][4];
++	u16 rxcomp[6];
++};
++
+ struct b43_phy_ht {
+ 	u16 rf_ctl_int_save[3];
+ 
+@@ -131,6 +151,9 @@
+ 	u8 tx_pwr_idx[3];
+ 
+ 	s32 bb_mult_save[3];
++	bool txcal_skip;
++	u8 pwork_count;
++	struct b43_phy_ht_cal cal;
+ 
+ 	u8 idle_tssi[3];
+ };
+@@ -139,4 +162,6 @@
+ struct b43_phy_operations;
+ extern const struct b43_phy_operations b43_phyops_ht;
+ 
++void b43_phy_ht_recal(struct b43_wldev *dev, bool associated);
++
+ #endif /* B43_PHY_HT_H_ */
+diff --git a/drivers/net/wireless/broadcom/b43/radio_2059.c b/drivers/net/wireless/broadcom/b43/radio_2059.c
+--- a/drivers/net/wireless/broadcom/b43/radio_2059.c
++++ b/drivers/net/wireless/broadcom/b43/radio_2059.c
+@@ -54,6 +54,11 @@
+ 
+ /* Extracted from MMIO dump of 6.30.223.141
+  * TODO: Values for channels 12 & 13 are outdated (from some old 5.x driver)!
++ *
++ * 5 GHz 40 MHz centre frequencies (5190, 5230, ...): 5230 is from a trace of
++ * the proprietary driver; the others are interpolated the way it matches:
++ * synthesizer word 4096 + f / 3, fractional part and BW1-6 halfway between
++ * the 20 MHz neighbours, the band-dependent rest from the upper neighbour.
+  */
+ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radio2059[] = {
+ 	{
+@@ -153,6 +158,13 @@
+ 		PHYREGS(0x081c, 0x0818, 0x0814, 0x01f9, 0x01fa, 0x01fb),
+ 	},
+ 	{
++		.freq			= 5190,
++		RADIOREGS(0xc2, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x07,
++			  0x02, 0x0c, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00,
++			  0x0f, 0x4f, 0x93, 0x00, 0xfb),
++		PHYREGS(0x0820, 0x081c, 0x0818, 0x01f8, 0x01f9, 0x01fa),
++	},
++	{
+ 		.freq			= 5200,
+ 		RADIOREGS(0xc5, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x08,
+ 			  0x02, 0x0c, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00,
+@@ -167,6 +179,13 @@
+ 		PHYREGS(0x082c, 0x0828, 0x0824, 0x01f5, 0x01f6, 0x01f7),
+ 	},
+ 	{
++		.freq			= 5230,
++		RADIOREGS(0xcf, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x0b,
++			  0x02, 0x0c, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00,
++			  0x0f, 0x4f, 0x93, 0x00, 0xda),
++		PHYREGS(0x0830, 0x082c, 0x0828, 0x01f4, 0x01f5, 0x01f6),
++	},
++	{
+ 		.freq			= 5240,
+ 		RADIOREGS(0xd2, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x0c,
+ 			  0x02, 0x0c, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00,
+@@ -181,6 +200,13 @@
+ 		PHYREGS(0x083c, 0x0838, 0x0834, 0x01f1, 0x01f2, 0x01f3),
+ 	},
+ 	{
++		.freq			= 5270,
++		RADIOREGS(0xdc, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x0f,
++			  0x02, 0x0b, 0x00, 0x0b, 0x00, 0x0b, 0x00, 0x00,
++			  0x0f, 0x4f, 0x93, 0x00, 0xb9),
++		PHYREGS(0x0840, 0x083c, 0x0838, 0x01f0, 0x01f1, 0x01f2),
++	},
++	{
+ 		.freq			= 5280,
+ 		RADIOREGS(0xe0, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x10,
+ 			  0x02, 0x0b, 0x00, 0x0b, 0x00, 0x0b, 0x00, 0x00,
+@@ -195,6 +221,13 @@
+ 		PHYREGS(0x084c, 0x0848, 0x0844, 0x01ee, 0x01ef, 0x01f0),
+ 	},
+ 	{
++		.freq			= 5310,
++		RADIOREGS(0xea, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x13,
++			  0x02, 0x0b, 0x00, 0x0b, 0x00, 0x0b, 0x00, 0x00,
++			  0x0f, 0x4c, 0x83, 0x00, 0xa8),
++		PHYREGS(0x0850, 0x084c, 0x0848, 0x01ed, 0x01ee, 0x01ef),
++	},
++	{
+ 		.freq			= 5320,
+ 		RADIOREGS(0xed, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x14,
+ 			  0x02, 0x0b, 0x00, 0x0b, 0x00, 0x0b, 0x00, 0x00,
+@@ -209,6 +242,13 @@
+ 		PHYREGS(0x089c, 0x0898, 0x0894, 0x01dc, 0x01dd, 0x01dd),
+ 	},
+ 	{
++		.freq			= 5510,
++		RADIOREGS(0x2c, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x27,
++			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
++			  0x0a, 0x46, 0x43, 0x00, 0x75),
++		PHYREGS(0x08a0, 0x089c, 0x0898, 0x01db, 0x01dc, 0x01dc),
++	},
++	{
+ 		.freq			= 5520,
+ 		RADIOREGS(0x30, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x28,
+ 			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
+@@ -223,6 +263,13 @@
+ 		PHYREGS(0x08ac, 0x08a8, 0x08a4, 0x01d8, 0x01d9, 0x01da),
+ 	},
+ 	{
++		.freq			= 5550,
++		RADIOREGS(0x3a, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x2b,
++			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
++			  0x0a, 0x46, 0x43, 0x00, 0x75),
++		PHYREGS(0x08b0, 0x08ac, 0x08a8, 0x01d7, 0x01d8, 0x01d9),
++	},
++	{
+ 		.freq			= 5560,
+ 		RADIOREGS(0x3d, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x2c,
+ 			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
+@@ -237,6 +284,13 @@
+ 		PHYREGS(0x08bc, 0x08b8, 0x08b4, 0x01d5, 0x01d6, 0x01d7),
+ 	},
+ 	{
++		.freq			= 5590,
++		RADIOREGS(0x47, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x2f,
++			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
++			  0x09, 0x44, 0x23, 0x00, 0x54),
++		PHYREGS(0x08c0, 0x08bc, 0x08b8, 0x01d4, 0x01d5, 0x01d6),
++	},
++	{
+ 		.freq			= 5600,
+ 		RADIOREGS(0x4a, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x30,
+ 			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
+@@ -251,6 +305,13 @@
+ 		PHYREGS(0x08cc, 0x08c8, 0x08c4, 0x01d2, 0x01d2, 0x01d3),
+ 	},
+ 	{
++		.freq			= 5630,
++		RADIOREGS(0x54, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x33,
++			  0x02, 0x07, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00,
++			  0x09, 0x44, 0x23, 0x00, 0x43),
++		PHYREGS(0x08d0, 0x08cc, 0x08c8, 0x01d1, 0x01d1, 0x01d2),
++	},
++	{
+ 		.freq			= 5640,
+ 		RADIOREGS(0x58, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x34,
+ 			  0x02, 0x07, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00,
+@@ -265,6 +326,13 @@
+ 		PHYREGS(0x08dc, 0x08d8, 0x08d4, 0x01ce, 0x01cf, 0x01d0),
+ 	},
+ 	{
++		.freq			= 5670,
++		RADIOREGS(0x62, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x37,
++			  0x02, 0x07, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00,
++			  0x09, 0x42, 0x23, 0x00, 0x43),
++		PHYREGS(0x08e0, 0x08dc, 0x08d8, 0x01cd, 0x01ce, 0x01cf),
++	},
++	{
+ 		.freq			= 5680,
+ 		RADIOREGS(0x65, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x38,
+ 			  0x02, 0x07, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00,
+@@ -286,6 +354,13 @@
+ 		PHYREGS(0x08fe, 0x08fa, 0x08f6, 0x01c8, 0x01c8, 0x01c9),
+ 	},
+ 	{
++		.freq			= 5755,
++		RADIOREGS(0x7e, 0x17, 0x20, 0x1f, 0x08, 0x08, 0x3f, 0x7f,
++			  0x04, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00,
++			  0x08, 0x42, 0x13, 0x00, 0x11),
++		PHYREGS(0x0902, 0x08fe, 0x08fa, 0x01c7, 0x01c7, 0x01c8),
++	},
++	{
+ 		.freq			= 5765,
+ 		RADIOREGS(0x81, 0x17, 0x20, 0x1f, 0x08, 0x08, 0x3f, 0x81,
+ 			  0x04, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00,
+@@ -300,6 +375,13 @@
+ 		PHYREGS(0x090e, 0x090a, 0x0906, 0x01c4, 0x01c5, 0x01c6),
+ 	},
+ 	{
++		.freq			= 5795,
++		RADIOREGS(0x8b, 0x17, 0x20, 0x1f, 0x08, 0x08, 0x3f, 0x87,
++			  0x04, 0x05, 0x00, 0x05, 0x00, 0x05, 0x00, 0x00,
++			  0x06, 0x41, 0x03, 0x00, 0x00),
++		PHYREGS(0x0912, 0x090e, 0x090a, 0x01c3, 0x01c4, 0x01c5),
++	},
++	{
+ 		.freq			= 5805,
+ 		RADIOREGS(0x8f, 0x17, 0x20, 0x1f, 0x08, 0x08, 0x3f, 0x89,
+ 			  0x04, 0x05, 0x00, 0x05, 0x00, 0x05, 0x00, 0x00,
+diff --git a/drivers/net/wireless/broadcom/b43/tables_phy_ht.c b/drivers/net/wireless/broadcom/b43/tables_phy_ht.c
+--- a/drivers/net/wireless/broadcom/b43/tables_phy_ht.c
++++ b/drivers/net/wireless/broadcom/b43/tables_phy_ht.c
+@@ -108,13 +108,16 @@
+ 	0x00000000, 0x00000000, 0x00000000, 0x00000000,
+ };
+ 
++/* Entries 3-10 and 14-21 as written by the proprietary driver at init (BCM4331);
++ * the values previously here differ from it in those entries.
++ */
+ static const u32 b43_httab_0x2f[] = {
+-	0x00035700, 0x0002cc9a, 0x00026666, 0x0001581f,
+-	0x0001581f, 0x0001581f, 0x0001581f, 0x0001581f,
+-	0x0001581f, 0x0001581f, 0x0001581f, 0x00035700,
+-	0x0002cc9a, 0x00026666, 0x0001581f, 0x0001581f,
+-	0x0001581f, 0x0001581f, 0x0001581f, 0x0001581f,
+-	0x0001581f, 0x0001581f,
++	0x00035700, 0x0002cc9a, 0x00026666, 0x00032064,
++	0x00032064, 0x00032064, 0x00032064, 0x00032064,
++	0x00032064, 0x0002583c, 0x0002583c, 0x00035700,
++	0x0002cc9a, 0x00026666, 0x00032064, 0x00032064,
++	0x00032064, 0x00032064, 0x00032064, 0x00032064,
++	0x0002583c, 0x0002583c,
+ };
+ 
+ static const u16 b43_httab_0x1a[] = {
+@@ -599,6 +602,46 @@
+ 	0x10090001, 0x10090001, 0x10090001, 0x10090001,
+ };
+ 
++/* TX gain table for the 5 GHz band, same layout as b43_httab_0x1a_0xc0_late
++ * (radio gain code in the high half, BB multiplier in the low byte). Taken
++ * from the values the proprietary driver uploads when it tunes to 5 GHz;
++ * using the 2.4 GHz table there leaves the PA ~23 dB short of normal power.
++ */
++const u32 b43_httab_0x1a_0xc0_late_5g[] = {
++	0x2f690044, 0x2f690040, 0x2f69003c, 0x2f690039,
++	0x2f690036, 0x2f690033, 0x2f690030, 0x2e690039,
++	0x2e690036, 0x2e690033, 0x2d69003a, 0x2d690037,
++	0x2d690034, 0x2d690031, 0x2c69003b, 0x2c690038,
++	0x2c690035, 0x2b690039, 0x2b690036, 0x2b690033,
++	0x2b690030, 0x2a690039, 0x2a690036, 0x2a690033,
++	0x2969003c, 0x29690038, 0x29690035, 0x29690032,
++	0x2869003a, 0x28690036, 0x28690033, 0x28690030,
++	0x28590035, 0x28590032, 0x2859002f, 0x28490035,
++	0x28490032, 0x2849002f, 0x28390032, 0x2839002f,
++	0x2839002d, 0x2839002a, 0x28290035, 0x28290032,
++	0x2829002f, 0x2829002c, 0x2829002a, 0x28290027,
++	0x28290025, 0x28190035, 0x28190032, 0x2819002f,
++	0x2819002d, 0x2819002a, 0x28190028, 0x28190026,
++	0x28190024, 0x28190022, 0x28190020, 0x2819001e,
++	0x28090036, 0x28090033, 0x28090031, 0x2809002e,
++	0x2809002b, 0x28090029, 0x28090027, 0x28090024,
++	0x28090022, 0x28090020, 0x2809001f, 0x2809001d,
++	0x2809001b, 0x2809001a, 0x28090018, 0x28090017,
++	0x28090016, 0x28090014, 0x28090013, 0x28090012,
++	0x28090011, 0x28090010, 0x2809000f, 0x2809000e,
++	0x2809000e, 0x2809000d, 0x2809000c, 0x2809000c,
++	0x2809000b, 0x2809000a, 0x2809000a, 0x28090009,
++	0x28090009, 0x28090008, 0x28090008, 0x28090007,
++	0x28090007, 0x28090006, 0x28090006, 0x28090006,
++	0x28090005, 0x28090005, 0x28090005, 0x28090005,
++	0x28090004, 0x28090004, 0x28090004, 0x28090004,
++	0x28090003, 0x28090003, 0x28090003, 0x28090003,
++	0x28090003, 0x28090003, 0x28090002, 0x28090002,
++	0x28090002, 0x28090002, 0x28090002, 0x28090002,
++	0x28090002, 0x28090002, 0x28090002, 0x28090001,
++	0x28090001, 0x28090001, 0x28090001, 0x28090001,
++};
++
+ /**************************************************
+  * R/W ops.
+  **************************************************/
+@@ -621,10 +664,13 @@
+ 		value = b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
+ 		break;
+ 	case B43_HTTAB_32BIT:
++		/* Reading DATALO latches the high half into DATAHI (and
++		 * advances the address); reading DATAHI first returns
++		 * whatever the previous access left there.
++		 */
+ 		b43_phy_write(dev, B43_PHY_HT_TABLE_ADDR, offset);
+-		value = b43_phy_read(dev, B43_PHY_HT_TABLE_DATAHI);
+-		value <<= 16;
+-		value |= b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
++		value = b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
++		value |= b43_phy_read(dev, B43_PHY_HT_TABLE_DATAHI) << 16;
+ 		break;
+ 	default:
+ 		B43_WARN_ON(1);
+@@ -658,9 +704,9 @@
+ 			data += 2;
+ 			break;
+ 		case B43_HTTAB_32BIT:
+-			*((u32 *)data) = b43_phy_read(dev, B43_PHY_HT_TABLE_DATAHI);
+-			*((u32 *)data) <<= 16;
+-			*((u32 *)data) |= b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
++			/* Low half first, see b43_httab_read() */
++			*((u32 *)data) = b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
++			*((u32 *)data) |= b43_phy_read(dev, B43_PHY_HT_TABLE_DATAHI) << 16;
+ 			data += 4;
+ 			break;
+ 		default:
+@@ -795,6 +841,8 @@
+ {
+ 	BUILD_BUG_ON(ARRAY_SIZE(b43_httab_0x1a_0xc0_late) !=
+ 			B43_HTTAB_1A_C0_LATE_SIZE);
++	BUILD_BUG_ON(ARRAY_SIZE(b43_httab_0x1a_0xc0_late_5g) !=
++			B43_HTTAB_1A_C0_LATE_SIZE);
+ 
+ 	httab_upload(dev, B43_HTTAB16(0x12, 0), b43_httab_0x12);
+ 	httab_upload(dev, B43_HTTAB16(0x27, 0), b43_httab_0x27);
+diff --git a/drivers/net/wireless/broadcom/b43/tables_phy_ht.h b/drivers/net/wireless/broadcom/b43/tables_phy_ht.h
+--- a/drivers/net/wireless/broadcom/b43/tables_phy_ht.h
++++ b/drivers/net/wireless/broadcom/b43/tables_phy_ht.h
+@@ -23,5 +23,6 @@
+ 
+ #define B43_HTTAB_1A_C0_LATE_SIZE		128
+ extern const u32 b43_httab_0x1a_0xc0_late[];
++extern const u32 b43_httab_0x1a_0xc0_late_5g[];
+ 
+ #endif /* B43_TABLES_PHY_HT_H_ */
+diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/broadcom/b43/xmit.c
+--- a/drivers/net/wireless/broadcom/b43/xmit.c
++++ b/drivers/net/wireless/broadcom/b43/xmit.c
+@@ -15,6 +15,7 @@
+ */
+ 
+ #include "xmit.h"
++#include "main.h"
+ #include "phy_common.h"
+ #include "dma.h"
+ #include "pio.h"
+@@ -173,7 +174,9 @@
+ 
+ 	if (phy->type == B43_PHYTYPE_LP)
+ 		bw = B43_TXH_PHY1_BW_20;
+-	else /* FIXME */
++	else if (phy->bw40 && phy->ctl_upper)	/* the primary 20 MHz */
++		bw = B43_TXH_PHY1_BW_20U;
++	else
+ 		bw = B43_TXH_PHY1_BW_20;
+ 
+ 	if (0) { /* FIXME: MIMO */
+@@ -186,12 +189,152 @@
+ 			control |= e->coding_rate;
+ 			control |= e->modulation;
+ 		}
++		/* On HT-PHY this bit makes the frame undecodable, see
++		 * b43_ht_phy_ctl3; the PHY takes the rate from the PLCP.
++		 */
++		if (phy->type == B43_PHYTYPE_HT)
++			control &= ~B43_TXH_PHY1_CRATE_2_3;
+ 		control |= B43_TXH_PHY1_MODE_SISO;
+ 	}
+ 
+ 	return control;
+ }
+ 
++/* 802.11n (HT) rates: 20 or 40 MHz, mixed-mode preamble.
++ * Upper byte of PHY control word 1 per MCS (coding rate bits 0-2,
++ * modulation bits 3-5, streams - 1 in bits 6-7), and data bits per OFDM
++ * symbol for one stream; as in brcmsmac's mcs_table, except coding rate
++ * 2/3 (MCS 5, 13, 21; and 48 Mbit/s OFDM): its code 1 (bit 8 of the
++ * control word) makes the HT-PHY send something nobody decodes, no
++ * error reported. The PHY takes the coding rate from the PLCP anyway:
++ * any even code sends correct frames, so 2/3 gets 0.
++ */
++static const u8 b43_ht_phy_ctl3[8] = {
++	0x00, 0x08, 0x0A, 0x10, 0x12, 0x18, 0x1A, 0x1C,
++};
++static const u16 b43_ht_ndbps[8] = { 26, 52, 78, 104, 156, 208, 234, 260 };
++
++/* 40 MHz: data bits per symbol are 54/26 of the 20 MHz ones */
++static unsigned int b43_ht_ndbps_bw(u8 mcs, bool ht40)
++{
++	unsigned int n = b43_ht_ndbps[mcs & 7];
++
++	return ht40 ? n * 54 / 26 : n;
++}
++
++static u16 b43_ht_tx_phy_ctl1(struct b43_wldev *dev, u8 mcs, bool ht40)
++{
++	u16 control;
++
++	if (ht40)
++		control = B43_TXH_PHY1_BW_40;
++	else if (dev->phy.bw40 && dev->phy.ctl_upper)
++		control = B43_TXH_PHY1_BW_20U;
++	else
++		control = B43_TXH_PHY1_BW_20;
++
++	/* One stream goes out of all chains with cyclic delay diversity */
++	control |= mcs < 8 ? B43_TXH_PHY1_MODE_CDD : B43_TXH_PHY1_MODE_SDM;
++	control |= (b43_ht_phy_ctl3[mcs & 7] | ((mcs >> 3) << 6)) << 8;
++	return control;
++}
++
++static void b43_generate_ht_plcp(struct b43_plcp_hdr6 *plcp,
++				 unsigned int len, u8 mcs, bool sgi, bool ht40)
++{
++	/* HT-SIG: MCS, 40 MHz; length; smoothing + not sounding + reserved,
++	 * short GI
++	 */
++	memset(plcp, 0, sizeof(*plcp));
++	plcp->raw[0] = mcs | (ht40 ? 0x80 : 0);
++	plcp->raw[1] = len & 0xFF;
++	plcp->raw[2] = len >> 8;
++	plcp->raw[3] = 0x07 | (sgi ? 0x80 : 0);
++}
++
++/* L-SIG length the hardware puts in front of a mixed-mode frame, so legacy
++ * stations defer for the whole HT frame: (TXTIME - 20 us) in 4 us symbols
++ * of 3 bytes, minus SERVICE and tail (IEEE 802.11-2012 20.3.9.4.3).
++ */
++static u16 b43_ht_lsig_len(u8 mcs, unsigned int len, bool sgi, bool ht40)
++{
++	unsigned int nss = (mcs >> 3) + 1;
++	unsigned int nsyms;
++
++	nsyms = DIV_ROUND_UP(16 + 8 * len + 6, b43_ht_ndbps_bw(mcs, ht40) * nss);
++	if (sgi)	/* 3.6 us symbols */
++		nsyms = DIV_ROUND_UP(nsyms * 9, 10);
++	/* HT-SIG (2), HT-STF (1) and the HT-LTFs */
++	nsyms += 3 + (nss == 3 ? 4 : nss);
++	return 3 * nsyms - 3;
++}
++
++unsigned int b43_ht_rate_kbps(u8 mcs, bool sgi, bool ht40)
++{
++	unsigned int bits = b43_ht_ndbps_bw(mcs, ht40) * ((mcs >> 3) + 1);
++
++	return sgi ? bits * 10000 / 36 : bits * 1000 / 4;
++}
++
++/* Length of the MPDU on the air: with FCS and the ICV/MIC the hardware
++ * appends
++ */
++unsigned int b43_tx_mpdu_len(struct sk_buff *skb)
++{
++	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++
++	return skb->len + FCS_LEN +
++	       (info->control.hw_key ? info->control.hw_key->icv_len : 0);
++}
++
++/* Turn a generated TX header into one MPDU of an A-MPDU (brcmsmac's
++ * ampdu_add_frame/ampdu_finalize): the first one carries the PPDU, so its
++ * PLCP gets the whole A-MPDU length and the aggregation bit. No RTS/CTS:
++ * its NAV would only cover the first MPDU.
++ */
++void b43_txhdr_ampdu(u8 *_txhdr, enum b43_ampdu_pos pos, bool first,
++		     unsigned int total, u8 ndelim)
++{
++	struct b43_txhdr *txhdr = (struct b43_txhdr *)_txhdr;
++	u32 mac_ctl = le32_to_cpu(txhdr->mac_ctl);
++	struct b43_plcp_hdr6 *plcp = &txhdr->format_598.plcp;
++
++	mac_ctl &= ~(B43_TXH_MAC_AMPDU | B43_TXH_MAC_SENDRTS |
++		     B43_TXH_MAC_SENDCTS | B43_TXH_MAC_STMSDU);
++	mac_ctl |= pos << 9;
++	if (first)
++		mac_ctl |= B43_TXH_MAC_STMSDU;
++	txhdr->mac_ctl = cpu_to_le32(mac_ctl);
++	/* Null delimiters after this MPDU, for the recipient's MPDU
++	 * start spacing
++	 */
++	txhdr->rts_plcp_fb.raw[5] = ndelim;
++
++	if (first) {
++		u8 mcs = plcp->raw[0] & 0x7F;
++		bool ht40 = plcp->raw[0] & 0x80;
++		bool sgi = plcp->raw[3] & 0x80;
++
++		plcp->raw[1] = total & 0xFF;
++		plcp->raw[2] = total >> 8;
++		plcp->raw[3] |= 0x08;
++		txhdr->mimo_modelen =
++			cpu_to_le16(b43_ht_lsig_len(mcs, total, sgi, ht40));
++	}
++}
++
++/* NAV for a unicast HT frame: SIFS + the legacy ACK, sent at the highest
++ * mandatory rate not above the MCS's legacy equivalent. mac80211 leaves it
++ * to the hardware for MCS rates.
++ */
++static __le16 b43_ht_duration(u8 mcs)
++{
++	static const u8 ack_ndbps[8] = { 24, 48, 48, 96, 96, 96, 96, 96 };
++
++	return cpu_to_le16(16 + 20 + 4 *
++			   DIV_ROUND_UP(16 + 14 * 8 + 6, ack_ndbps[mcs & 7]));
++}
++
+ static u8 b43_calc_fallback_rate(u8 bitrate, int gmode)
+ {
+ 	switch (bitrate) {
+@@ -258,25 +401,74 @@
+ 	u8 extra_ft = 0;
+ 	struct ieee80211_rate *txrate;
+ 	struct ieee80211_tx_rate *rates;
++	bool mcs, mcs_fb = false, sgi, sgi_fb = false;
++	bool ht40, ht40_fb = false;
++	u8 mcs_idx = 0, mcs_fb_idx = 0;
+ 
+ 	memset(txhdr, 0, sizeof(*txhdr));
+ 
+-	txrate = ieee80211_get_tx_rate(dev->wl->hw, info);
+-	rate = txrate ? txrate->hw_value : B43_CCK_RATE_1MB;
++	rates = info->control.rates;
++	/* HT: the legacy "rate" below is only a placeholder for paths that
++	 * still assume one (RTS fallback etc.).
++	 */
++	mcs = rates[0].flags & IEEE80211_TX_RC_MCS;
++	sgi = rates[0].flags & IEEE80211_TX_RC_SHORT_GI;
++	/* Only while the PHY runs 40 MHz wide (not on a 20 MHz scan channel) */
++	ht40 = phy->bw40 && rates[0].flags & IEEE80211_TX_RC_40_MHZ_WIDTH;
++	if (mcs) {
++		mcs_idx = rates[0].idx;
++		txrate = NULL;
++		rate = B43_OFDM_RATE_6MB;
++	} else {
++		txrate = ieee80211_get_tx_rate(dev->wl->hw, info);
++		rate = txrate ? txrate->hw_value : B43_CCK_RATE_1MB;
++	}
+ 	rate_ofdm = b43_is_ofdm_rate(rate);
+-	fbrate = ieee80211_get_alt_retry_rate(dev->wl->hw, info, 0) ? : txrate;
+-	rate_fb = fbrate->hw_value;
++	fbrate = txrate;
++	if (rates[1].idx >= 0 && (rates[1].flags & IEEE80211_TX_RC_MCS)) {
++		mcs_fb = true;
++		mcs_fb_idx = rates[1].idx;
++		sgi_fb = rates[1].flags & IEEE80211_TX_RC_SHORT_GI;
++		ht40_fb = phy->bw40 &&
++			  rates[1].flags & IEEE80211_TX_RC_40_MHZ_WIDTH;
++	} else if (rates[1].idx >= 0) {
++		fbrate = ieee80211_get_alt_retry_rate(dev->wl->hw, info, 0);
++	} else if (mcs) {
++		mcs_fb = true;
++		mcs_fb_idx = mcs_idx;
++		sgi_fb = sgi;
++		ht40_fb = ht40;
++	}
++	rate_fb = mcs_fb ? B43_OFDM_RATE_6MB : fbrate->hw_value;
+ 	rate_fb_ofdm = b43_is_ofdm_rate(rate_fb);
+ 
+-	if (rate_ofdm)
++	if (mcs)
++		txhdr->phy_rate = mcs_idx;
++	else if (rate_ofdm)
+ 		txhdr->phy_rate = b43_plcp_get_ratecode_ofdm(rate);
+ 	else
+ 		txhdr->phy_rate = b43_plcp_get_ratecode_cck(rate);
+ 	txhdr->mac_frame_ctl = wlhdr->frame_control;
+ 	memcpy(txhdr->tx_receiver, wlhdr->addr1, ETH_ALEN);
+ 
++	if (mcs && wlhdr->duration_id == cpu_to_le16(0) &&
++	    !(info->flags & IEEE80211_TX_CTL_NO_ACK) &&
++	    !is_multicast_ether_addr(wlhdr->addr1))
++		((struct ieee80211_hdr *)fragment_data)->duration_id =
++			b43_ht_duration(mcs_idx);
++
+ 	/* Calculate duration for fallback rate */
+-	if ((rate_fb == rate) ||
++	if (mcs || mcs_fb) {
++		if (!mcs_fb)
++			txhdr->dur_fb = ieee80211_generic_frame_duration(
++				dev->wl->hw, info->control.vif, info->band,
++				fragment_len, fbrate);
++		else if (wlhdr->duration_id & cpu_to_le16(0x8000) ||
++			 wlhdr->duration_id == cpu_to_le16(0))
++			txhdr->dur_fb = wlhdr->duration_id;
++		else
++			txhdr->dur_fb = b43_ht_duration(mcs_fb_idx);
++	} else if ((rate_fb == rate) ||
+ 	    (wlhdr->duration_id & cpu_to_le16(0x8000)) ||
+ 	    (wlhdr->duration_id == cpu_to_le16(0))) {
+ 		/* If the fallback rate equals the normal rate or the
+@@ -339,8 +531,13 @@
+ 	}
+ 	switch (dev->fw.hdr_format) {
+ 	case B43_FW_HDR_598:
+-		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_598.plcp),
+-				      plcp_fragment_len, rate);
++		if (mcs)
++			b43_generate_ht_plcp(&txhdr->format_598.plcp,
++					     plcp_fragment_len, mcs_idx, sgi,
++					     ht40);
++		else
++			b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_598.plcp),
++					      plcp_fragment_len, rate);
+ 		break;
+ 	case B43_FW_HDR_351:
+ 		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_351.plcp),
+@@ -351,11 +548,17 @@
+ 				      plcp_fragment_len, rate);
+ 		break;
+ 	}
+-	b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->plcp_fb),
+-			      plcp_fragment_len, rate_fb);
++	if (mcs_fb)
++		b43_generate_ht_plcp(&txhdr->plcp_fb, plcp_fragment_len,
++				     mcs_fb_idx, sgi_fb, ht40_fb);
++	else
++		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->plcp_fb),
++				      plcp_fragment_len, rate_fb);
+ 
+ 	/* Extra Frame Types */
+-	if (rate_fb_ofdm)
++	if (mcs_fb)
++		extra_ft |= B43_TXH_EFT_FB_HT;
++	else if (rate_fb_ofdm)
+ 		extra_ft |= B43_TXH_EFT_FB_OFDM;
+ 	else
+ 		extra_ft |= B43_TXH_EFT_FB_CCK;
+@@ -364,10 +567,12 @@
+ 	 * this value before comparing it to the value in SHM, if this
+ 	 * is a 5Ghz packet.
+ 	 */
+-	txhdr->chan_radio_code = phy->channel;
++	txhdr->chan_radio_code = phy->cookie_chan;
+ 
+ 	/* PHY TX Control word */
+-	if (rate_ofdm)
++	if (mcs)
++		phy_ctl |= B43_TXH_PHY_ENC_HT;
++	else if (rate_ofdm)
+ 		phy_ctl |= B43_TXH_PHY_ENC_OFDM;
+ 	else
+ 		phy_ctl |= B43_TXH_PHY_ENC_CCK;
+@@ -393,6 +598,18 @@
+ 	default:
+ 		B43_WARN_ON(1);
+ 	}
++	/* HT rates use all TX chains (mask in bits 6-8; the legacy default
++	 * above names only two)
++	 */
++	if (mcs && phy->type == B43_PHYTYPE_HT) {
++		phy_ctl &= ~B43_TXH_PHY_ANT;
++		phy_ctl |= 0x7 << 6;
++	}
++	/* Experiment: override the TX antenna/core bits (B43_TXH_PHY_ANT). */
++	if (b43_modparam_txant >= 0) {
++		phy_ctl &= ~B43_TXH_PHY_ANT;
++		phy_ctl |= b43_modparam_txant & B43_TXH_PHY_ANT;
++	}
+ 
+ 	rates = info->control.rates;
+ 	/* MAC control */
+@@ -553,11 +770,21 @@
+ 	}
+ 
+ 	if (fill_phy_ctl1) {
+-		txhdr->phy_ctl1 =
+-			cpu_to_le16(b43_generate_tx_phy_ctl1(dev, rate));
+-		txhdr->phy_ctl1_fb =
+-			cpu_to_le16(b43_generate_tx_phy_ctl1(dev, rate_fb));
+-	}
++		txhdr->phy_ctl1 = cpu_to_le16(mcs ?
++			b43_ht_tx_phy_ctl1(dev, mcs_idx, ht40) :
++			b43_generate_tx_phy_ctl1(dev, rate));
++		txhdr->phy_ctl1_fb = cpu_to_le16(mcs_fb ?
++			b43_ht_tx_phy_ctl1(dev, mcs_fb_idx, ht40_fb) :
++			b43_generate_tx_phy_ctl1(dev, rate_fb));
++	}
++	if (mcs)
++		txhdr->mimo_modelen =
++			cpu_to_le16(b43_ht_lsig_len(mcs_idx, plcp_fragment_len,
++						    sgi, ht40));
++	if (mcs_fb)
++		txhdr->mimo_ratelen_fb =
++			cpu_to_le16(b43_ht_lsig_len(mcs_fb_idx, plcp_fragment_len,
++						    sgi_fb, ht40_fb));
+ 
+ 	/* Apply the bitfields */
+ 	txhdr->mac_ctl = cpu_to_le32(mac_ctl);
+@@ -741,11 +968,31 @@
+ 		break;
+ 	}
+ 
+-	if (phystat0 & B43_RX_PHYST0_OFDM)
++	switch (phystat0 & B43_RX_PHYST0_FTYPE) {
++	case B43_RX_PHYST0_PRE_N:
++	case B43_RX_PHYST0_STD_N:
++		/* HT: the PLCP is HT-SIG, MCS in the first byte (bit 7 =
++		 * 40 MHz); the fourth has STBC in bits 4-5, LDPC in bit 6
++		 * and short GI in bit 7.
++		 */
++		rate_idx = plcp->raw[0] & 0x7F;
++		status.encoding = RX_ENC_HT;
++		if (plcp->raw[0] & 0x80)
++			status.bw = RATE_INFO_BW_40;
++		if (plcp->raw[3] & 0x80)
++			status.enc_flags |= RX_ENC_FLAG_SHORT_GI;
++		if (plcp->raw[3] & 0x40)
++			status.enc_flags |= RX_ENC_FLAG_LDPC;
++		status.enc_flags |= ((plcp->raw[3] >> 4) & 3) <<
++				    RX_ENC_FLAG_STBC_SHIFT;
++		break;
++	case B43_RX_PHYST0_OFDM:
+ 		rate_idx = b43_plcp_get_bitrate_idx_ofdm(plcp,
+ 					!!(chanstat & B43_RX_CHAN_5GHZ));
+-	else
++		break;
++	default:
+ 		rate_idx = b43_plcp_get_bitrate_idx_cck(plcp);
++	}
+ 	if (unlikely(rate_idx == -1)) {
+ 		/* PLCP seems to be corrupted.
+ 		 * Drop the frame, if we are not interested in corrupted frames. */
+@@ -798,6 +1045,9 @@
+ 			status.band = NL80211_BAND_2GHZ;
+ 		status.freq =
+ 			ieee80211_channel_to_frequency(chanid, status.band);
++		/* 40 MHz wide the cookie is the centre channel */
++		if (dev->phy.bw40 && chanid == dev->phy.cookie_chan)
++			status.freq = dev->phy.chandef->chan->center_freq;
+ 		break;
+ 	default:
+ 		B43_WARN_ON(1);
+@@ -820,9 +1070,13 @@
+ {
+ 	b43_debugfs_log_txstat(dev, status);
+ 
+-	if (status->intermediate)
++	if (status->for_ampdu) {
++		/* The status of a whole A-MPDU we built (DMA only) */
++		if (!b43_using_pio_transfers(dev))
++			b43_dma_handle_txstatus(dev, status);
+ 		return;
+-	if (status->for_ampdu)
++	}
++	if (status->intermediate)
+ 		return;
+ 	if (!status->acked)
+ 		dev->wl->ieee_stats.dot11ACKFailureCount++;
+diff --git a/drivers/net/wireless/broadcom/b43/xmit.h b/drivers/net/wireless/broadcom/b43/xmit.h
+--- a/drivers/net/wireless/broadcom/b43/xmit.h
++++ b/drivers/net/wireless/broadcom/b43/xmit.h
+@@ -221,6 +221,12 @@
+ 	u8 intermediate;	/* Intermediate status notification (not final) */
+ 	u8 for_ampdu;		/* Status is for an AMPDU (afterburner) */
+ 	u8 acked;		/* Wireless ACK received */
++	/* A-MPDU answered by a BlockAck: its starting sequence number and
++	 * bitmap (second status word pair)
++	 */
++	bool ba;
++	u16 ba_start;
++	u8 ba_bitmap[8];
+ };
+ 
+ /* txstatus supp_reason values */
+@@ -356,6 +362,19 @@
+ 
+ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr);
+ 
++/* Position of an MPDU in an A-MPDU, as in the TX header */
++enum b43_ampdu_pos {
++	B43_AMPDU_NONE = 0,
++	B43_AMPDU_FIRST,
++	B43_AMPDU_INTER,
++	B43_AMPDU_LAST,		/* also a single-MPDU A-MPDU */
++};
++
++unsigned int b43_ht_rate_kbps(u8 mcs, bool sgi, bool ht40);
++unsigned int b43_tx_mpdu_len(struct sk_buff *skb);
++void b43_txhdr_ampdu(u8 *txhdr, enum b43_ampdu_pos pos, bool first,
++		     unsigned int total, u8 ndelim);
++
+ void b43_handle_txstatus(struct b43_wldev *dev,
+ 			 const struct b43_txstatus *status);
+ bool b43_fill_txstatus_report(struct b43_wldev *dev,
