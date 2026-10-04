@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 13:11:55 +1100
-Subject: [PATCH 6/8] wifi: b43: return -EOPNOTSUPP for ciphers the hardware
+Subject: [PATCH 3/8] wifi: b43: return -EOPNOTSUPP for ciphers the hardware
  can't do
 
 Since b43 advertises MFP, mac80211 hands it the BIP key of every

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 13:09:32 +1100
-Subject: [PATCH 1/8] wifi: b43: HT-PHY: read the low half of 32-bit table
+Subject: [PATCH 5/8] wifi: b43: HT-PHY: read the low half of 32-bit table
  entries first
 
 Reading the DATALO register latches the high half of a 32-bit table
@@ -51,5 +51,3 @@ index 1acf2df66e5e..3b91bfffb09e 100644
  			data += 4;
  			break;
  		default:
-
-base-commit: f49defea7668d8c68ec19fa085ef3da6075561c7

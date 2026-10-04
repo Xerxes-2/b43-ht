@@ -45,15 +45,15 @@ the table below before the patch is sent.
 
 ## Upstream status
 
-| # | Patch | Tested alone (BCM4331, 2.4 GHz, 6.18 b43 + this patch only) | Sent | Status |
-|---|---|---|---|---|
-| 1 | HT-PHY: read the low half of 32-bit table entries first | No visible effect: the stale read only hits core 0 on the first channel switch, later calls latch the right value | | |
-| 2 | HT-PHY: fix the TX power estimate table upload | Table read back: odd entries 0 before, monotonic after. Monitor signal -4..5 dB, minstrel success 36M 40%→84%, 54M 31%→60% | | |
-| 3 | HT-PHY: restore the baseband multipliers to the right slots | Not observable: the only playback is during init, the channel switch rewrites the slots | | |
-| 4 | HT-PHY: fix saving and restoring the TX power control index | Not observable: power control is only toggled at init, when nothing has been saved | | |
-| 5 | HT-PHY: don't flag coding rate 2/3 in PHY control word 1 | Monitor decodes 0 of ~2500 frames at 48M before, 124 after (54M visible in both) | | |
-| 6 | return -EOPNOTSUPP for ciphers the hardware can't do | WARN in b43_op_set_key and "failed to set key (4, ...) (-22)" on every PMF connection before, none after | | |
-| 7 | encrypt protected management frames in software | Our SA Query responses / RM reports / deauth decrypt with the PTK only after; before they match a QoS-data nonce/AAD | | |
+| # | Patch | Batch | Tested alone (BCM4331, 2.4 GHz, 6.18 b43 + this patch only) | Sent | Status |
+|---|---|---|---|---|---|
+| 1 | HT-PHY: fix the TX power estimate table upload | 1 | Table read back: odd entries 0 before, monotonic after. Monitor signal -4..5 dB, minstrel success 36M 40%→84%, 54M 31%→60% | | |
+| 2 | HT-PHY: don't flag coding rate 2/3 in PHY control word 1 | 1 | Monitor decodes 0 of ~2500 frames at 48M before, 124 after (54M visible in both) | | |
+| 3 | return -EOPNOTSUPP for ciphers the hardware can't do | 1 | WARN in b43_op_set_key and "failed to set key (4, ...) (-22)" on every PMF connection before, none after | | |
+| 4 | encrypt protected management frames in software | 1 | Our SA Query responses / RM reports / deauth decrypt with the PTK only after; before they match a QoS-data nonce/AAD | | |
+| 5 | HT-PHY: read the low half of 32-bit table entries first | held: needs the 5 GHz / calibration code that reaches it | No visible effect: the stale read only hits core 0 on the first channel switch, later calls latch the right value | | |
+| 6 | HT-PHY: restore the baseband multipliers to the right slots | held: needs the 5 GHz / calibration code that reaches it | Not observable: the only playback is during init, the channel switch rewrites the slots | | |
+| 7 | HT-PHY: fix saving and restoring the TX power control index | held: needs the 5 GHz / calibration code that reaches it | Not observable: power control is only toggled at init, when nothing has been saved | | |
 
 b43 is orphaned (MAINTAINERS: `S: Orphan`); patches go to
 linux-wireless@vger.kernel.org and b43-dev@lists.infradead.org and are

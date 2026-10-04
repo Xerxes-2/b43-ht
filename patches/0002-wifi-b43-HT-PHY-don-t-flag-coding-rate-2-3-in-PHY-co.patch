@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 13:11:23 +1100
-Subject: [PATCH 5/8] wifi: b43: HT-PHY: don't flag coding rate 2/3 in PHY
+Subject: [PATCH 2/8] wifi: b43: HT-PHY: don't flag coding rate 2/3 in PHY
  control word 1
 
 With B43_TXH_PHY1_CRATE_2_3 set, the HT-PHY transmits frames that no

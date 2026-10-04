@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 13:09:48 +1100
-Subject: [PATCH 2/8] wifi: b43: HT-PHY: fix the TX power estimate table upload
+Subject: [PATCH 1/8] wifi: b43: HT-PHY: fix the TX power estimate table upload
 
 The table of estimated output power per TSSI value was built as an
 array of u32 but uploaded with a 16-bit bulk write, which steps through
@@ -44,3 +44,5 @@ index fab8399c64f7..57f80093e9d1 100644
  		}
  		b43_httab_write_bulk(dev, B43_HTTAB16(26 + c, 0), 64, regval);
  	}
+
+base-commit: f49defea7668d8c68ec19fa085ef3da6075561c7
