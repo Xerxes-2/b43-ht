@@ -611,6 +611,37 @@ the cookie earlier or later depending on the path, so attributing by cookie mixe
 Close-range A/B (6 alternating loads): same throughput, RX retry rate 0.15–0.20% vs 0.16–0.17%, no visible difference,
 as expected (sensitivity-related effects only show at long range). Since these are all wl's values with no regression, enabled by default.
 
+## Round 18: TX FIFO underflow with long A-MPDUs at MCS 14/15 (2026-10-04, in progress)
+
+Found while testing at medium signal (Mac mini in a metal bin, 5 GHz at -60 dBm, HT40 MCS 14/15): every TX test logs dozens of
+"PHY transmission error" per second (behind net_ratelimit, so the log undercounts it). Same with the previous build, so not a regression.
+
+- Only when we transmit data; never in the RX direction (A-MPDUs of TCP ACKs), never at 2.4 GHz / 20 MHz.
+- txfunfl[BE] (SHM macstat) counts them one to one. The A-MPDU concerned gets a TX status with suppress reason 3 (brcmsmac:
+  TX_STATUS_SUPR_FRAG, which its ffpld code treats as the underflow event) and none of its MPDUs is sent. ~8% of all A-MPDUs.
+- Fixed MCS 12 or 13: (almost) none. Fixed MCS 14 or 15: hundreds per 10 s, at MCS 15 enough to trip the controller restart.
+- Depends on the A-MPDU length: < 16 KB never, 16–48 KB ~5–10%, 56–64 KB 20–25%. A-MPDUs containing retried MPDUs are worse
+  (24–40 KB: ~28% vs ~2%), which is also why it shows at medium signal and was 0 at close range (round 16).
+- Not the fallback fields: brcmsmac's ampdu_finalize also sets the fallback L-SIG length and PLCP aggregation bit; doing so changes
+  nothing. B43_TXH_MAC_USEFBR stops the underflows, but because it sends the whole A-MPDU at the fallback rate (MCS 7; checked by
+  logging rate/fallback pairs), UDP drops to ~120.
+- Not "nothing prefetched": capping only A-MPDUs queued when none is in flight does not help.
+- This is what brcmsmac's ffpld code handles: DMA slower than the PHY at the top MCS, so the FIFO drains during a long PPDU; it
+  preloads (TX header preload_size; stalls this firmware) and failing that lowers the per-MCS A-MPDU size on underflow feedback.
+
+Cap on the A-MPDU length at MCS 14/15 (> 250 Mbit/s), same position, alternating runs, Mbit/s:
+
+| cap | underflows / 10 s | UDP TX | TCP TX |
+|---|---|---|---|
+| none (64 KB) | 430–600 | 165–179 | 62–90 |
+| 48 KB | 520–600 | 178–179 | 68–90 |
+| 32 KB | 46–202 | 205–208 | 133–149 |
+| 24 KB | 0–14 | 191–197 | 142–145 |
+| 16 KB | 0–9 | 174–176 | 118–121 |
+
+wl at the same position: UDP 176, TCP 75. To do: check a cap at close range (where 64 KB A-MPDUs gave UDP 220 without
+underflows), then choose between a fixed cap and brcmsmac-style adaptation from txfunfl.
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl
