@@ -8,3 +8,4 @@
 0007-wifi-b43-HT-PHY-fix-saving-and-restoring-the-TX-powe.patch
 0008-b43-HT-PHY-5-GHz-802.11n-and-the-rest-not-yet-split-.patch
 0009-wifi-b43-report-PHY-transmission-errors-as-a-count-e.patch
+0010-b43-HT-PHY-shorten-A-MPDUs-per-MCS-after-TX-FIFO-und.patch

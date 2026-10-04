@@ -119,6 +119,7 @@ the table below before the patch is sent.
 | 6 | HT-PHY: restore the baseband multipliers to the right slots | held: needs the 5 GHz / calibration code that reaches it | Not observable: the only playback is during init, the channel switch rewrites the slots | | |
 | 7 | HT-PHY: fix saving and restoring the TX power control index | held: needs the 5 GHz / calibration code that reaches it | Not observable: power control is only toggled at init, when nothing has been saved | | |
 | 9 | report PHY transmission errors as a count every 15 s | candidate for batch 2 | Not yet tested alone (no PHY TX errors at 2.4 GHz). Full series, 5 GHz MCS 15 at -59 dBm: "N PHY transmission errors in the last 15 s", N = 420-815 without an A-MPDU limit, matching txfunfl | | |
+| 10 | HT-PHY: shorten A-MPDUs per MCS after TX FIFO underflows | not upstream on its own (needs A-MPDU TX from patch 8) | Full series, 5 GHz HT40 MCS 15: underflows 400-600 -> 8-17 per 10 s, TCP TX 55-79 -> 130-137 | | |
 
 b43 is orphaned (MAINTAINERS: `S: Orphan`); patches go to
 linux-wireless@vger.kernel.org and b43-dev@lists.infradead.org and are

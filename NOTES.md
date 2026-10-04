@@ -655,8 +655,21 @@ Same position (-59 dBm), alternating, two runs of each per load, Mbit/s:
 | `ufl-cap` | 0–95 | 186–203 | 122–148 |
 | `ufl-adapt` | 13–19 | 183–197 | 129–140 |
 
-`ufl-adapt` settles at 14–35 KB for MCS 14/15 here. To do: compare both at close range (64 KB A-MPDUs gave UDP 220 there,
-with no underflows), then pick one.
+`ufl-adapt` settles at 14–35 KB for MCS 14/15 here.
+
+Close range (-36 dBm), same alternation:
+
+| | underflows / 10 s | UDP TX | TCP TX | TCP RX |
+|---|---|---|---|---|
+| none | 400–584 | 164–176 | 55–79 | 186–189 |
+| `ufl-cap` | 0–75 | 192–201 | 126–135 | 186–188 |
+| `ufl-adapt` | 8–17 | 196–200 | 130–137 | 185–187 |
+
+Underflows happen at close range too, and the adaptive limit stays at 11–33 KB there. Chose `ufl-adapt` (patch 0010): the
+right length depends on the host's DMA speed, so a fixed value tuned on this Mac mini may not suit other BCM4331 machines.
+Open question: round 15 measured UDP 220 / TCP 161–166 with zero underflows at the same spot; the build from before this
+round (1b5ea18) now also gives ~170 / ~70 without the limit, so something outside the driver changed (AP firmware or
+settings?). Even with the limit TX stays below those numbers.
 
 PHY TX errors are now logged as a count every 15 s instead of one rate-limited message each (patch 0009).
 

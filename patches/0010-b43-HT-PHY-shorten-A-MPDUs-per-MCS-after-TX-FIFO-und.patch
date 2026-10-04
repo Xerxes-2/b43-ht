@@ -1,0 +1,174 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 21:00:02 +1100
+Subject: [PATCH wireless-next 10/10] b43: HT-PHY: shorten A-MPDUs per MCS
+ after TX FIFO underflows
+
+At 40 MHz MCS 14/15 DMA can't feed the PHY fast enough through a long
+A-MPDU: the TX FIFO underflows, the ucode raises a PHY TX error and
+drops the whole aggregate, reporting suppress reason 3. With A-MPDUs of
+up to 64 KB this happened 400-600 times per 10 s of TCP or UDP TX, at
+close range as well as at -60 dBm.
+
+brcmsmac first raises the TX header preload size and then lowers the
+A-MPDU size per MCS; any preload stalls this firmware, so do only the
+latter, per bandwidth and MCS. Unlike brcmsmac the limit recovers: an
+underflow cuts it to 3/4 of the lost A-MPDU (at least 8 KB), and each
+A-MPDU that reached the limit raises it by 8 bytes, so it settles where
+underflows are rare.
+
+Measured at -36 dBm, ch44 HT40 MCS 15, Mbit/s: underflows per 10 s
+400-584 -> 8-17, UDP TX 164-176 -> 196-200, TCP TX 55-79 -> 130-137,
+TCP RX unchanged at ~186. The limits settled at 11-33 KB for MCS 14/15.
+
+Depends on the A-MPDU TX support in the previous patch.
+
+Assisted-by: pi:claude-opus-5-5
+---
+ drivers/net/wireless/broadcom/b43/b43.h  |  4 ++
+ drivers/net/wireless/broadcom/b43/dma.c  | 50 ++++++++++++++++++++++++
+ drivers/net/wireless/broadcom/b43/main.c | 12 ++++--
+ 3 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/b43.h b/drivers/net/wireless/broadcom/b43/b43.h
+index 1827af9cae02..99d30d4e5fa2 100644
+--- a/drivers/net/wireless/broadcom/b43/b43.h
++++ b/drivers/net/wireless/broadcom/b43/b43.h
+@@ -955,6 +955,10 @@ struct b43_wl {
+ 	u8 ampdu_nssn[IEEE80211_NUM_TIDS];
+ 	/* Last BAR start sequence sent per TID, 0x8000 set when valid */
+ 	u16 ampdu_bar_ssn[IEEE80211_NUM_TIDS];
++	/* A-MPDU length limit per bandwidth (20/40 MHz) and MCS after TX
++	 * FIFO underflows, 0 = none; see dma_ampdu_underflow()
++	 */
++	u16 ampdu_ufl_len[2][24];
+ 
+ 	/* The beacon we are currently using (AP or IBSS mode). */
+ 	struct sk_buff *current_beacon;
+diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broadcom/b43/dma.c
+index 30ddebf408b7..fe169ee8fd26 100644
+--- a/drivers/net/wireless/broadcom/b43/dma.c
++++ b/drivers/net/wireless/broadcom/b43/dma.c
+@@ -1564,6 +1564,42 @@ static void dma_ampdu_send_bar(struct b43_wldev *dev, struct ieee80211_vif *vif,
+ 	ieee80211_send_bar(vif, ra, tid, ssn << 4);
+ }
+ 
++/* At 40 MHz MCS 14/15 DMA can't keep up with the PHY through a long
++ * A-MPDU: the TX FIFO underflows, the ucode counts it in txfunfl, reports
++ * the PHY error and drops the whole aggregate: none of it is sent and the
++ * status has suppress reason 3, B43_TXST_SUPP_PREV (_UNDER never shows
++ * up; brcmsmac also takes its TX_STATUS_SUPR_FRAG on an
++ * A-MPDU as an underflow). How often depends on the length:
++ * none below 16 KB, ~8% of all A-MPDUs at up to 64 KB with some retries
++ * in them. brcmsmac first raises the TX header preload size and then lowers
++ * the A-MPDU size per MCS; any preload stalls this firmware, so only the
++ * latter, per bandwidth and MCS. Unlike brcmsmac the limit recovers: an
++ * underflow cuts it to 3/4 of the lost A-MPDU, every A-MPDU that reached
++ * it raises it a little, so it settles where underflows are rare.
++ */
++#define B43_AMPDU_UFL_MIN	8192
++#define B43_AMPDU_UFL_STEP	8
++
++static void dma_ampdu_underflow(struct b43_wl *wl, bool ht40, u8 mcs,
++				unsigned int len, bool underflow)
++{
++	u16 *limit;
++
++	if (mcs >= ARRAY_SIZE(wl->ampdu_ufl_len[0]))
++		return;
++	limit = &wl->ampdu_ufl_len[ht40][mcs];
++	if (underflow) {
++		len = min_t(unsigned int, len, *limit ? : U16_MAX);
++		*limit = max(len * 3 / 4, B43_AMPDU_UFL_MIN);
++	} else if (*limit && len + 2 * 1600 >= *limit) {
++		/* That one was cut short by the limit (within ~2 MPDUs) */
++		if (*limit > U16_MAX - B43_AMPDU_UFL_STEP)
++			*limit = 0;
++		else
++			*limit += B43_AMPDU_UFL_STEP;
++	}
++}
++
+ static void dma_handle_ampdu_txstatus(struct b43_wldev *dev,
+ 				      struct b43_dmaring *ring, int slot,
+ 				      const struct b43_txstatus *status)
+@@ -1577,6 +1613,9 @@ static void dma_handle_ampdu_txstatus(struct b43_wldev *dev,
+ 	struct ieee80211_vif *vif = NULL;
+ 	u8 ra[ETH_ALEN], tid = 0;
+ 	int gaveup = -1;
++	unsigned int len = 0;
++	bool ht40 = false;
++	int mcs = -1;
+ 
+ 	__skb_queue_head_init(&retry);
+ 	if (ring->ampdu_inflight > 0)
+@@ -1617,8 +1656,10 @@ static void dma_handle_ampdu_txstatus(struct b43_wldev *dev,
+ 		ring->used_slots--;
+ 
+ 		hdr = (struct ieee80211_hdr *)skb->data;
++		len += skb->len;
+ 		if (first) {
+ 			struct b43_wl *wl = dev->wl;
++			struct ieee80211_tx_rate *rate = &info->control.rates[0];
+ 			u8 tid = ieee80211_get_tid(hdr);
+ 			u16 seq = le16_to_cpu(hdr->seq_ctrl) >> 4;
+ 			int i;
+@@ -1630,6 +1671,12 @@ static void dma_handle_ampdu_txstatus(struct b43_wldev *dev,
+ 					wl->ampdu_ssn[tid][--wl->ampdu_nssn[tid]];
+ 				break;
+ 			}
++			if (rate->flags & IEEE80211_TX_RC_MCS) {
++				mcs = rate->idx;
++				ht40 = dev->phy.bw40 &&
++				       rate->flags &
++				       IEEE80211_TX_RC_40_MHZ_WIDTH;
++			}
+ 			first = false;
+ 		}
+ 		if (status->ba) {
+@@ -1657,6 +1704,9 @@ static void dma_handle_ampdu_txstatus(struct b43_wldev *dev,
+ 		slot = next_slot(ring, slot);
+ 	}
+ 
++	if (mcs >= 0)
++		dma_ampdu_underflow(dev->wl, ht40, mcs, len,
++				    status->supp_reason == B43_TXST_SUPP_PREV);
+ 	if (gaveup >= 0 && vif)
+ 		dma_ampdu_send_bar(dev, vif, ra, tid, gaveup, &retry);
+ 
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index f0d0d33d3fdd..8d0e57a0c5dd 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -3742,6 +3742,7 @@ static int b43_tx_ampdu(struct b43_wldev *dev, int queue_num,
+ 	u8 tid = ieee80211_get_tid(hdr);
+ 	unsigned int kbps, max_len, max_frames, min_bytes, total = 0, len = 0;
+ 	struct sk_buff_head agg;
++	bool ht40;
+ 	u8 ndelim[64];
+ 	unsigned int n = 0, i;
+ 	u16 ssn;
+@@ -3760,15 +3761,20 @@ static int b43_tx_ampdu(struct b43_wldev *dev, int queue_num,
+ 		if (((ssn - wl->ampdu_ssn[tid][i]) & 0xFFF) < 0x800)
+ 			ssn = wl->ampdu_ssn[tid][i];
+ 
++	ht40 = dev->phy.bw40 && rate->flags & IEEE80211_TX_RC_40_MHZ_WIDTH;
+ 	kbps = b43_ht_rate_kbps(rate->idx,
+-				rate->flags & IEEE80211_TX_RC_SHORT_GI,
+-				dev->phy.bw40 &&
+-				rate->flags & IEEE80211_TX_RC_40_MHZ_WIDTH);
++				rate->flags & IEEE80211_TX_RC_SHORT_GI, ht40);
+ 	/* 3 ms on the air (brcmsmac: 5 ms). Measured at MCS 15 up to 5 ms
+ 	 * without losses at the tail; on a busy 2.4 GHz channel TCP did a
+ 	 * bit worse at 5 ms than at 3.
+ 	 */
+ 	max_len = min(wl->ampdu_max_len, kbps * 3 / 8);
++	if (rate->idx < ARRAY_SIZE(wl->ampdu_ufl_len[0])) {
++		u16 ufl_len = wl->ampdu_ufl_len[ht40][rate->idx];
++
++		if (ufl_len)
++			max_len = min_t(unsigned int, max_len, ufl_len);
++	}
+ 	/* MPDU start spacing: the recipient's, but at least 16 us. DMA
+ 	 * fetches every MPDU separately and can't keep up with a run of tiny
+ 	 * ones (TCP ACKs) at high MCS: the TX FIFO underflows and the PHY
