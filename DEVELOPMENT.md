@@ -43,6 +43,63 @@ make O=../linux-build olddefconfig prepare
 5. Rebase on wireless-next from time to time:
    `git fetch && git rebase origin/main`, then re-run 2 and 3.
 
+## Submission rules
+
+Besides Documentation/process/submitting-patches.rst, linux-wireless has its
+own rules
+(https://wireless.docs.kernel.org/en/latest/en/developers/documentation/submittingpatches.html).
+The ones that matter here:
+
+- **Target tree in the subject prefix**: `[PATCH wireless-next n/m]`. Fixes
+  for regressions or serious bugs in the current release would go to
+  `wireless`; the bugs fixed here date back to 2011-2020 and are not
+  recent regressions, so everything goes to wireless-next. `export-series.sh` sets
+  the prefix; in the kernel tree `git config format.subjectPrefix "PATCH
+  wireless-next"`, with b4 `b4 prep --set-prefixes wireless-next`.
+- **Subject** `wifi: b43: ...` (`wifi: b43: HT-PHY: ...` for HT-PHY code),
+  imperative.
+- **Description says why.** Problem, effect for users, how it was tested. If
+  a fix has no user-visible effect (only theoretical), say so plainly. A
+  bulleted list of changes usually means the patch should be split.
+- **Tags**: `Fixes: <12-char sha> ("subject")` when a commit introduced the
+  bug, above `Assisted-by:` and `Signed-off-by:`. checkpatch verifies the
+  sha and subject.
+- **Series size**: at most about 7-12 patches. A new version resends the
+  whole series as `[PATCH wireless-next v2 n/m]`, with the changes since v1
+  in the cover letter.
+- **Addressing**: To linux-wireless@vger.kernel.org. b43 has no maintainer,
+  so Cc b43-dev@lists.infradead.org, and people who reviewed b43 recently
+  (Michael Büsch acked the N-PHY rev 8 series in 2026). Check with
+  `scripts/get_maintainer.pl`.
+- **Mail**: plain text, inline patches, no PGP signature, no top-posting.
+  b4 (web endpoint) takes care of the first three.
+- **Follow-up**: status is on patchwork
+  (https://patchwork.kernel.org/project/linux-wireless/list/), not by
+  pinging the maintainer.
+
+### AI assistance
+
+The wireless maintainer, Johannes Berg, said in August 2026 (LKML thread
+"sysbot AI patches and wireless",
+https://lore.kernel.org/lkml/3b6c46b6d79f3a0e0ded2967db3cfd469314b05c.camel@sipsolutions.net/)
+that he will ignore syzbot's AI-generated patches unless a quick look shows
+they are obviously right, and won't argue with an LLM. The thread is about
+syzbot, but the complaints apply to any assisted patch: narrow point fixes
+with a lot of explanation around them, where nobody stepped back to ask
+what the code should do in the first place, and human "reviewers" who only
+pass LLM output along. So:
+
+- `Assisted-by:` is required and stays honest; the submitter signs off only
+  after reviewing and understanding every patch.
+- The submitter must be able to explain and defend each patch on the list,
+  in their own words. Replies to review are written by the submitter, not
+  pasted from an assistant.
+- Prefer the fix that matches the hardware's semantics over a patch on top
+  of wrong code (e.g. don't set a field the PHY ignores, rather than
+  setting it and masking a bit back out).
+- Keep descriptions short: the facts, the measurement, one or two key
+  references. Background goes in NOTES.md or the cover letter.
+
 ## Testing fixes for upstream
 
 Each fix is tested on its own, against the configuration upstream users
@@ -64,4 +121,4 @@ the table below before the patch is sent.
 
 b43 is orphaned (MAINTAINERS: `S: Orphan`); patches go to
 linux-wireless@vger.kernel.org and b43-dev@lists.infradead.org and are
-picked up by the wireless maintainers.
+picked up by the wireless maintainers (see Submission rules).

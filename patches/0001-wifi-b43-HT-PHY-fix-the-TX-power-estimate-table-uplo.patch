@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 13:09:48 +1100
-Subject: [PATCH 1/8] wifi: b43: HT-PHY: fix the TX power estimate table upload
+Subject: [PATCH wireless-next 1/8] wifi: b43: HT-PHY: fix the TX power
+ estimate table upload
 
 b43_phy_ht_tx_power_ctl_setup() builds the table of estimated output
 power per TSSI value as an array of u32, like its N-PHY counterpart
