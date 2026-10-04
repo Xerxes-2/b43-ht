@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 13:11:55 +1100
+Subject: [PATCH 6/8] wifi: b43: return -EOPNOTSUPP for ciphers the hardware
+ can't do
+
+Since b43 advertises MFP, mac80211 hands it the BIP key of every
+connection with management frame protection, and possibly GCMP keys.
+b43_op_set_key() treats any cipher other than WEP, TKIP and CCMP as a
+driver bug: it warns (with CONFIG_B43_DEBUG) and returns -EINVAL, which
+mac80211 reports as a failure to set the key before falling back to
+software crypto.
+
+Return -EOPNOTSUPP, which tells mac80211 to do the cipher in software
+without complaint.
+
+Fixes: 75d057bda1fb ("b43: Fix connection problem with WPA3")
+Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+---
+ drivers/net/wireless/broadcom/b43/main.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 817448e58e7f..13f6d9623c8a 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -4222,7 +4222,8 @@ static int b43_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 		algorithm = B43_SEC_ALGO_AES;
+ 		break;
+ 	default:
+-		B43_WARN_ON(1);
++		/* e.g. BIP for MFP: mac80211 does it in software */
++		err = -EOPNOTSUPP;
+ 		goto out_unlock;
+ 	}
+ 	index = (u8) (key->keyidx);

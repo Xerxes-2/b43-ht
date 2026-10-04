@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 13:09:48 +1100
+Subject: [PATCH 2/8] wifi: b43: HT-PHY: fix the TX power estimate table upload
+
+The table of estimated output power per TSSI value was built as an
+array of u32 but uploaded with a 16-bit bulk write, which steps through
+the buffer two bytes at a time. Each core's 64-entry table thus got the
+low and high halves of the first 32 values: entry 2k held the estimate
+for TSSI k and every odd entry 0 or 0xffff. Closed-loop TX power
+control works from these estimates.
+
+Build the table as u16.
+
+Fixes: 5949e0406041 ("b43: HT-PHY: setup TX power control")
+Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+---
+ drivers/net/wireless/broadcom/b43/phy_ht.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/broadcom/b43/phy_ht.c
+index fab8399c64f7..57f80093e9d1 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_ht.c
++++ b/drivers/net/wireless/broadcom/b43/phy_ht.c
+@@ -714,13 +714,13 @@ static void b43_phy_ht_tx_power_ctl_setup(struct b43_wldev *dev)
+ 
+ 	for (c = 0; c < 3; c++) {
+ 		s32 num, den, pwr;
+-		u32 regval[64];
++		u16 regval[64];
+ 
+ 		for (i = 0; i < 64; i++) {
+ 			num = 8 * (16 * b0[c] + b1[c] * i);
+ 			den = 32768 + a1[c] * i;
+ 			pwr = max((4 * num + den / 2) / den, -8);
+-			regval[i] = pwr;
++			regval[i] = (u16)pwr;
+ 		}
+ 		b43_httab_write_bulk(dev, B43_HTTAB16(26 + c, 0), 64, regval);
+ 	}

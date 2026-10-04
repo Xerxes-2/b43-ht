@@ -18,7 +18,12 @@ stdenv.mkDerivation {
   unpackPhase = ''
     tar -xf $src --strip-components=1 --wildcards '*/drivers/net/wireless/broadcom/b43/*'
   '';
-  patches = [ ../patches/b43-ht.patch ];
+  # In the order of patches/series (comments and blank lines skipped)
+  patches = map (name: ../patches + "/${name}") (
+    builtins.filter (l: l != "" && builtins.substring 0 1 l != "#") (
+      lib.splitString "\n" (builtins.readFile ../patches/series)
+    )
+  );
   nativeBuildInputs = kernel.moduleBuildDependencies;
   makeFlags =
     kernelModuleMakeFlags

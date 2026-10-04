@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 13:10:22 +1100
+Subject: [PATCH 3/8] wifi: b43: HT-PHY: restore the baseband multipliers to
+ the right slots
+
+Each core's baseband multiplier lives in table 13 at 0x63 + 4 * core,
+with a copy at 0x73 + 4 * core; b43_phy_ht_tx_power_fix() writes both.
+b43_phy_ht_stop_playback() restored the copy to 0x67 + 4 * core
+instead, overwriting core 1's multiplier with core 0's and core 2's
+with core 1's.
+
+At the moment this only happens around the idle TSSI measurement during
+init, and the channel switch that follows rewrites the multipliers, so
+the damage is short-lived; it would not be with any later use of tone
+playback (e.g. calibration).
+
+Fixes: 371ec465a358 ("b43: HT-PHY: implement stopping sample tone playback")
+Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+---
+ drivers/net/wireless/broadcom/b43/phy_ht.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/broadcom/b43/phy_ht.c
+index 57f80093e9d1..b259fefc3826 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_ht.c
++++ b/drivers/net/wireless/broadcom/b43/phy_ht.c
+@@ -350,7 +350,7 @@ static void b43_phy_ht_stop_playback(struct b43_wldev *dev)
+ 		if (phy_ht->bb_mult_save[i] >= 0) {
+ 			b43_httab_write(dev, B43_HTTAB16(13, 0x63 + i * 4),
+ 					phy_ht->bb_mult_save[i]);
+-			b43_httab_write(dev, B43_HTTAB16(13, 0x67 + i * 4),
++			b43_httab_write(dev, B43_HTTAB16(13, 0x73 + i * 4),
+ 					phy_ht->bb_mult_save[i]);
+ 		}
+ 	}

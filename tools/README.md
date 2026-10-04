@@ -6,6 +6,8 @@ drive the tests from; "DUT" is the Mac mini running b43 (or wl).
 
 | Tool | Runs on | Purpose |
 |------|---------|---------|
+| `export-series.sh` | workstation | Export the commit series from a kernel tree into `patches/` (see DEVELOPMENT.md) |
+| `kbuild-check.sh` | workstation | Build b43 at every commit of a range (W=1) and run checkpatch --strict on each |
 | `env.example.sh` | workstation | Template for `env.sh`: ssh target, IPs, MACs, BSSIDs, interface names |
 | `air.sh` | workstation (sourced) | Monitor-mode helpers: `mon_on`, `mon_off`, `sig` (iperf3 + capture of DUT frames, signal and ACK counts) |
 | `bench.sh` | workstation | Ping and TCP throughput both ways over the DUT's Wi-Fi address, plus `iw` station stats |

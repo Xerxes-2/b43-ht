@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 13:10:46 +1100
+Subject: [PATCH 4/8] wifi: b43: HT-PHY: fix saving and restoring the TX power
+ control index
+
+When TX power control is disabled, its current gain index is saved so
+that re-enabling it can start from there. Two bugs:
+
+- The whole status register was saved. The index is in bits 8-14; the
+  low byte holds the estimated output power. The saved value was almost
+  always above B43_PHY_HT_TXPCTL_CMD_C1_INIT, so it was never restored.
+- Restoring wrote the index to the command registers with a plain
+  write. For core 1 that is TXPCTL_CMD_C1, which also holds the enable
+  bits set just before: power control would be switched off again.
+
+Currently power control is only toggled once, during init, right after
+a PHY reset, when nothing has been saved yet; the bugs would show as
+soon as it is disabled and re-enabled around anything else.
+
+Fixes: 418e8b680516 ("b43: HT-PHY: store TX power state before disabling it")
+Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+---
+ drivers/net/wireless/broadcom/b43/phy_ht.c | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/broadcom/b43/phy_ht.c
+index b259fefc3826..cca3a5ebd8e5 100644
+--- a/drivers/net/wireless/broadcom/b43/phy_ht.c
++++ b/drivers/net/wireless/broadcom/b43/phy_ht.c
+@@ -546,10 +546,14 @@ static void b43_phy_ht_tx_power_ctl(struct b43_wldev *dev, bool enable)
+ 
+ 	if (!enable) {
+ 		if (b43_phy_read(dev, B43_PHY_HT_TXPCTL_CMD_C1) & en_bits) {
+-			/* We disable enabled TX pwr ctl, save it's state */
++			/* We disable enabled TX pwr ctl, save its state.
++			 * The status registers hold the current gain index
++			 * in bits 8-14; the low byte is the power estimate.
++			 */
+ 			for (i = 0; i < 3; i++)
+ 				phy_ht->tx_pwr_idx[i] =
+-					b43_phy_read(dev, status_regs[i]);
++					(b43_phy_read(dev, status_regs[i]) >> 8) &
++					B43_PHY_HT_TXPCTL_CMD_C1_INIT;
+ 		}
+ 		b43_phy_mask(dev, B43_PHY_HT_TXPCTL_CMD_C1, 0xffff & ~en_bits);
+ 	} else {
+@@ -560,11 +564,15 @@ static void b43_phy_ht_tx_power_ctl(struct b43_wldev *dev, bool enable)
+ 				b43_phy_write(dev, cmd_regs[i], 0x32);
+ 		}
+ 
++		/* Only replace the index field: a plain write would also
++		 * clear the enable bits in CMD_C1 set above.
++		 */
+ 		for (i = 0; i < 3; i++)
+ 			if (phy_ht->tx_pwr_idx[i] <=
+ 			    B43_PHY_HT_TXPCTL_CMD_C1_INIT)
+-				b43_phy_write(dev, cmd_regs[i],
+-					      phy_ht->tx_pwr_idx[i]);
++				b43_phy_maskset(dev, cmd_regs[i],
++						~B43_PHY_HT_TXPCTL_CMD_C1_INIT,
++						phy_ht->tx_pwr_idx[i]);
+ 	}
+ 
+ 	phy_ht->tx_pwr_ctl = enable;

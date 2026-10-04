@@ -40,7 +40,8 @@ with every dead end, is in [NOTES.md](NOTES.md).
 ### Generic b43 fixes in the patch
 
 These fixes are not specific to 5 GHz. Each is a candidate for a separate
-upstream patch:
+upstream patch; the ones already split out are listed in
+[DEVELOPMENT.md](DEVELOPMENT.md#upstream-status):
 
 - 32-bit HT-PHY table reads must read the low word first.
 - `stop_playback` restored the BB multiplier to the wrong slot.
@@ -98,11 +99,12 @@ connections.
 
 ### Elsewhere
 
-Apply `patches/b43-ht.patch` to a kernel tree (made against 6.18) and build
+Apply the patches listed in `patches/series`, in order, to a kernel tree
+(wireless-next; they also apply to 6.18) and build
 `drivers/net/wireless/broadcom/b43`:
 
 ```sh
-patch -p1 < b43-ht.patch
+for p in $(grep -v '^#' patches/series); do patch -p1 < patches/$p; done
 make M=drivers/net/wireless/broadcom/b43 modules
 ```
 
@@ -128,7 +130,10 @@ Then load it with `htphy_5ghz=2 htphy_11n=3`.
 
 ## Repository
 
-- `patches/b43-ht.patch` is the driver patch.
+- `patches/` holds the driver patch series, exported from a kernel tree
+  (`patches/series` gives the order and the base commit). The first patches
+  are self-contained fixes meant for upstream; the last one holds everything
+  not yet split out. See [DEVELOPMENT.md](DEVELOPMENT.md).
 - `nix/` holds the package and the NixOS module.
 - `NOTES.md` is the reverse-engineering log.
 - `tools/` holds the trace decoders, register-diff and measurement scripts

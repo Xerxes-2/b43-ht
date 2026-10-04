@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 13:11:55 +1100
+Subject: [PATCH 7/8] wifi: b43: encrypt protected management frames in
+ software
+
+With management frame protection, unicast robust management frames
+(action frames such as SA Query and Block Ack setup, deauthentication,
+disassociation) are CCMP-protected. When the key is in hardware, b43's
+crypto engine encrypts them like data frames, and the peer can't
+decrypt the result: it drops them. Presumably the engine predates
+802.11w and doesn't set the Management flag in the CCM nonce.
+
+Set IEEE80211_KEY_FLAG_SW_MGMT_TX on CCMP keys so that mac80211
+encrypts management frames itself; data frames still use the hardware.
+
+Fixes: 75d057bda1fb ("b43: Fix connection problem with WPA3")
+Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+---
+ drivers/net/wireless/broadcom/b43/main.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 13f6d9623c8a..3eabe7b41add 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -4267,6 +4267,11 @@ static int b43_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+ 		key->flags |= IEEE80211_KEY_FLAG_GENERATE_IV;
+ 		if (algorithm == B43_SEC_ALGO_TKIP)
+ 			key->flags |= IEEE80211_KEY_FLAG_GENERATE_MMIC;
++		/* The engine gets CCMP of protected management frames
++		 * wrong; let mac80211 encrypt those.
++		 */
++		if (algorithm == B43_SEC_ALGO_AES)
++			key->flags |= IEEE80211_KEY_FLAG_SW_MGMT_TX;
+ 		break;
+ 	case DISABLE_KEY: {
+ 		err = b43_key_clear(dev, key->hw_key_idx);

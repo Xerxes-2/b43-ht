@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 13:11:23 +1100
+Subject: [PATCH 5/8] wifi: b43: HT-PHY: don't flag coding rate 2/3 in PHY
+ control word 1
+
+With B43_TXH_PHY1_CRATE_2_3 set, the HT-PHY transmits frames that no
+receiver decodes, and reports no error. Among legacy rates this bit is
+only used for 48 Mbit/s, so on BCM4331 every 48 Mbit/s frame was lost:
+with the rate fixed to 48 Mbit/s nothing gets through, and rate control
+keeps paying for retries at it.
+
+Sweeping the coding rate field shows the HT-PHY takes the rate from the
+PLCP header: any even value transmits correct frames, any odd value
+fails. Clear the bit on HT-PHY only; brcmsmac sets it on N-PHY.
+
+Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+---
+ drivers/net/wireless/broadcom/b43/xmit.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/broadcom/b43/xmit.c
+index f0b082596637..4de6e5042c55 100644
+--- a/drivers/net/wireless/broadcom/b43/xmit.c
++++ b/drivers/net/wireless/broadcom/b43/xmit.c
+@@ -186,6 +186,11 @@ static u16 b43_generate_tx_phy_ctl1(struct b43_wldev *dev, u8 bitrate)
+ 			control |= e->coding_rate;
+ 			control |= e->modulation;
+ 		}
++		/* The HT-PHY takes the coding rate from the PLCP header;
++		 * with this bit set it sends frames nobody can decode.
++		 */
++		if (phy->type == B43_PHYTYPE_HT)
++			control &= ~B43_TXH_PHY1_CRATE_2_3;
+ 		control |= B43_TXH_PHY1_MODE_SISO;
+ 	}
+ 

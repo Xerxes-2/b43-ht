@@ -43,7 +43,7 @@ except rxtx5a/rxtx92 for channels 12/13 (the b43 source itself marks these TODO 
 5230 is the center frequency wl uses for HT40 (44+48); b43 does not do HT40, so it is not needed.
 Conclusion: what's missing for 5GHz is not the channel table; main.c simply rejects 5GHz on HT PHY.
 
-## Patch `patches/b43-ht.patch`
+## Patch (now the series in `patches/`)
 
 - Module parameter `htphy_5ghz`: 0 off (default, same as mainline), 1 RX only, 2 full.
 - Only registers the 24 5GHz channels present in the 2059 table.

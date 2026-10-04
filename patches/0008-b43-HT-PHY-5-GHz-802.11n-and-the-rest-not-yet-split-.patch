@@ -1,7 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 13:12:31 +1100
+Subject: [PATCH 8/8] b43: HT-PHY: 5 GHz, 802.11n and the rest (not yet split,
+ not for submission)
+
+Everything else from b43-ht: 5 GHz support (channel and gain tables,
+power control, calibrations), 802.11n (HT rates, A-MPDU, 40 MHz, LDPC
+receive), per-channel PHY settings, and further fixes still to be split
+out (controller restart, PM bit during scans, slot time on band
+switch, ...). See NOTES.md in https://github.com/Xerxes-2/b43-ht.
+
+Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+---
+ drivers/net/wireless/broadcom/b43/b43.h       |   18 +
+ drivers/net/wireless/broadcom/b43/dma.c       |  273 ++++-
+ drivers/net/wireless/broadcom/b43/dma.h       |   12 +
+ drivers/net/wireless/broadcom/b43/main.c      |  505 +++++++-
+ drivers/net/wireless/broadcom/b43/main.h      |    1 +
+ .../net/wireless/broadcom/b43/phy_common.c    |   12 +-
+ .../net/wireless/broadcom/b43/phy_common.h    |    9 +
+ drivers/net/wireless/broadcom/b43/phy_ht.c    | 1064 ++++++++++++++++-
+ drivers/net/wireless/broadcom/b43/phy_ht.h    |   25 +
+ .../net/wireless/broadcom/b43/radio_2059.c    |   82 ++
+ .../net/wireless/broadcom/b43/tables_phy_ht.c |   57 +-
+ .../net/wireless/broadcom/b43/tables_phy_ht.h |    1 +
+ drivers/net/wireless/broadcom/b43/xmit.c      |  293 ++++-
+ drivers/net/wireless/broadcom/b43/xmit.h      |   19 +
+ 14 files changed, 2293 insertions(+), 78 deletions(-)
+
 diff --git a/drivers/net/wireless/broadcom/b43/b43.h b/drivers/net/wireless/broadcom/b43/b43.h
+index c0d8fc0b22fb..1827af9cae02 100644
 --- a/drivers/net/wireless/broadcom/b43/b43.h
 +++ b/drivers/net/wireless/broadcom/b43/b43.h
-@@ -937,6 +937,24 @@
+@@ -937,6 +937,24 @@ struct b43_wl {
  
  	bool radiotap_enabled;
  	bool radio_enabled;
@@ -27,9 +58,10 @@ diff --git a/drivers/net/wireless/broadcom/b43/b43.h b/drivers/net/wireless/broa
  	/* The beacon we are currently using (AP or IBSS mode). */
  	struct sk_buff *current_beacon;
 diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broadcom/b43/dma.c
+index 05da6987a845..30ddebf408b7 100644
 --- a/drivers/net/wireless/broadcom/b43/dma.c
 +++ b/drivers/net/wireless/broadcom/b43/dma.c
-@@ -1186,8 +1186,16 @@
+@@ -1183,8 +1183,16 @@ struct b43_dmaring *parse_cookie(struct b43_wldev *dev, u16 cookie, int *slot)
  	return ring;
  }
  
@@ -47,7 +79,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broa
  {
  	const struct b43_dma_ops *ops = ring->ops;
  	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
-@@ -1223,6 +1231,9 @@
+@@ -1220,6 +1228,9 @@ static int dma_tx_fragment(struct b43_dmaring *ring,
  		ring->used_slots = old_used_slots;
  		return err;
  	}
@@ -57,7 +89,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broa
  
  	meta_hdr->dmaaddr = map_descbuffer(ring, (unsigned char *)header,
  					   hdrsize, 1);
-@@ -1241,6 +1252,8 @@
+@@ -1238,6 +1249,8 @@ static int dma_tx_fragment(struct b43_dmaring *ring,
  
  	meta->skb = skb;
  	meta->is_last_fragment = true;
@@ -66,7 +98,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broa
  	priv_info->bouncebuffer = NULL;
  
  	meta->dmaaddr = map_descbuffer(ring, skb->data, skb->len, 1);
-@@ -1274,9 +1287,12 @@
+@@ -1271,9 +1284,12 @@ static int dma_tx_fragment(struct b43_dmaring *ring,
  		b43_shm_write16(ring->dev, B43_SHM_SHARED,
  				B43_SHM_SH_MCASTCOOKIE, cookie);
  	}
@@ -81,7 +113,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broa
  	return 0;
  
  out_unmap_hdr:
-@@ -1383,7 +1399,7 @@
+@@ -1380,7 +1396,7 @@ int b43_dma_tx(struct b43_wldev *dev, struct sk_buff *skb)
  	 * static, so we don't need to store it per frame. */
  	ring->queue_prio = skb_get_queue_mapping(skb);
  
@@ -90,7 +122,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broa
  	if (unlikely(err == -ENOKEY)) {
  		/* Drop this packet, as we don't have the encryption key
  		 * anymore and must not transmit it unencrypted. */
-@@ -1411,6 +1427,249 @@
+@@ -1408,6 +1424,249 @@ int b43_dma_tx(struct b43_wldev *dev, struct sk_buff *skb)
  	return err;
  }
  
@@ -340,7 +372,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broa
  void b43_dma_handle_txstatus(struct b43_wldev *dev,
  			     const struct b43_txstatus *status)
  {
-@@ -1470,6 +1729,11 @@
+@@ -1467,6 +1726,11 @@ void b43_dma_handle_txstatus(struct b43_wldev *dev,
  	}
  
  	ops = ring->ops;
@@ -352,7 +384,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broa
  	while (1) {
  		B43_WARN_ON(slot < 0 || slot >= ring->nr_slots);
  		/* get meta - ignore returned value */
-@@ -1560,6 +1824,7 @@
+@@ -1557,6 +1821,7 @@ void b43_dma_handle_txstatus(struct b43_wldev *dev,
  		if (skip > 0)
  			--skip;
  	}
@@ -361,9 +393,10 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broa
  		B43_WARN_ON(free_slots(ring) < TX_SLOTS_PER_FRAME);
  		ring->stopped = false;
 diff --git a/drivers/net/wireless/broadcom/b43/dma.h b/drivers/net/wireless/broadcom/b43/dma.h
+index f9f65bbe2d76..618c76e0ac6e 100644
 --- a/drivers/net/wireless/broadcom/b43/dma.h
 +++ b/drivers/net/wireless/broadcom/b43/dma.h
-@@ -190,6 +190,12 @@
+@@ -190,6 +190,12 @@ struct b43_dmadesc_meta {
  	dma_addr_t dmaaddr;
  	/* ieee80211 TX status. Only used once per 802.11 frag. */
  	bool is_last_fragment;
@@ -376,7 +409,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.h b/drivers/net/wireless/broa
  };
  
  struct b43_dmaring;
-@@ -257,6 +263,8 @@
+@@ -255,6 +261,8 @@ struct b43_dmaring {
  	enum b43_dmatype type;
  	/* Boolean. Is this ring stopped at ieee80211 level? */
  	bool stopped;
@@ -385,7 +418,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.h b/drivers/net/wireless/broa
  	/* The QOS priority assigned to this ring. Only used for TX rings.
  	 * This is the mac80211 "queue" value. */
  	u8 queue_prio;
-@@ -293,6 +301,10 @@
+@@ -293,6 +301,10 @@ void b43_dma_tx_resume(struct b43_wldev *dev);
  
  int b43_dma_tx(struct b43_wldev *dev,
  	       struct sk_buff *skb);
@@ -397,6 +430,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/dma.h b/drivers/net/wireless/broa
  			     const struct b43_txstatus *status);
  
 diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 3eabe7b41add..9d39f877303a 100644
 --- a/drivers/net/wireless/broadcom/b43/main.c
 +++ b/drivers/net/wireless/broadcom/b43/main.c
 @@ -38,6 +38,7 @@
@@ -407,7 +441,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  #include "dma.h"
  #include "pio.h"
  #include "sysfs.h"
-@@ -85,6 +86,22 @@
+@@ -85,6 +86,22 @@ static int modparam_hwpctl;
  module_param_named(hwpctl, modparam_hwpctl, int, 0444);
  MODULE_PARM_DESC(hwpctl, "Enable hardware-side power control (default off)");
  
@@ -430,7 +464,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  static int modparam_nohwcrypt;
  module_param_named(nohwcrypt, modparam_nohwcrypt, int, 0444);
  MODULE_PARM_DESC(nohwcrypt, "Disable hardware encryption.");
-@@ -317,6 +334,18 @@
+@@ -318,6 +335,18 @@ static struct ieee80211_channel b43_5ghz_aphy_chantable[] = {
  	CHAN5G(216, 0),
  };
  #undef CHAN4G
@@ -449,7 +483,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  #undef CHAN5G
  
  static struct ieee80211_supported_band b43_band_5GHz_nphy = {
-@@ -327,6 +356,14 @@
+@@ -328,6 +357,14 @@ static struct ieee80211_supported_band b43_band_5GHz_nphy = {
  	.n_bitrates	= b43_a_ratetable_size,
  };
  
@@ -464,7 +498,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  static struct ieee80211_supported_band b43_band_5GHz_nphy_limited = {
  	.band		= NL80211_BAND_5GHZ,
  	.channels	= b43_5ghz_nphy_chantable_limited,
-@@ -351,6 +388,38 @@
+@@ -352,6 +389,38 @@ static struct ieee80211_supported_band b43_band_2GHz = {
  	.n_bitrates	= b43_g_ratetable_size,
  };
  
@@ -503,7 +537,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  static struct ieee80211_supported_band b43_band_2ghz_limited = {
  	.band		= NL80211_BAND_2GHZ,
  	.channels	= b43_2ghz_chantable,
-@@ -703,17 +772,30 @@
+@@ -704,17 +773,30 @@ static void b43_write_mac_bssid_templates(struct b43_wldev *dev)
  
  static void b43_upload_card_macaddress(struct b43_wldev *dev)
  {
@@ -537,7 +571,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	/* Shared memory location 0x0010 is the slot time and should be
  	 * set to slot_time; however, this register is initially 0 and changing
  	 * the value adversely affects the transmit rate for BCM4311
-@@ -1237,7 +1319,15 @@
+@@ -1238,7 +1320,15 @@ static void b43_bcma_phy_reset(struct b43_wldev *dev)
  	/* Put PHY into reset */
  	flags = bcma_aread32(dev->dev->bdev, BCMA_IOCTL);
  	flags |= B43_BCMA_IOCTL_PHY_RESET;
@@ -554,7 +588,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	bcma_awrite32(dev->dev->bdev, BCMA_IOCTL, flags);
  	udelay(2);
  
-@@ -1353,6 +1443,34 @@
+@@ -1354,6 +1444,34 @@ static void handle_irq_transmit_status(struct b43_wldev *dev)
  		stat.intermediate = !!(tmp & 0x0040);
  		stat.for_ampdu = !!(tmp & 0x0020);
  		stat.acked = !!(tmp & 0x0002);
@@ -589,7 +623,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  
  		b43_handle_txstatus(dev, &stat);
  	}
-@@ -2588,7 +2706,8 @@
+@@ -2597,7 +2715,8 @@ static void b43_request_firmware(struct work_struct *work)
  start_ieee80211:
  	wl->hw->queues = B43_QOS_QUEUE_NUM;
  	if (!modparam_qos || dev->fw.opensource ||
@@ -599,7 +633,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  		wl->hw->queues = 1;
  
  	err = ieee80211_register_hw(wl->hw);
-@@ -3580,6 +3699,164 @@
+@@ -3589,6 +3708,164 @@ static int b43_rng_init(struct b43_wl *wl)
  	return err;
  }
  
@@ -764,7 +798,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  static void b43_tx_work(struct work_struct *work)
  {
  	struct b43_wl *wl = container_of(work, struct b43_wl, tx_work);
-@@ -3598,6 +3875,26 @@
+@@ -3607,6 +3884,26 @@ static void b43_tx_work(struct work_struct *work)
  	for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
  		while (skb_queue_len(&wl->tx_queue[queue_num])) {
  			skb = skb_dequeue(&wl->tx_queue[queue_num]);
@@ -791,7 +825,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  			if (b43_using_pio_transfers(dev))
  				err = b43_pio_tx(dev, skb);
  			else
-@@ -3637,8 +3934,20 @@
+@@ -3646,8 +3943,20 @@ static void b43_op_tx(struct ieee80211_hw *hw,
  	}
  	B43_WARN_ON(skb_shinfo(skb)->nr_frags);
  
@@ -812,7 +846,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	if (!wl->tx_queue_stopped[skb_queue_mapping])
  		ieee80211_queue_work(wl->hw, &wl->tx_work);
  	else
-@@ -3883,9 +4192,15 @@
+@@ -3892,9 +4201,15 @@ static const char *band_to_string(enum nl80211_band band)
  
  /* Expects wl->mutex locked */
  static int b43_switch_band(struct b43_wldev *dev,
@@ -829,7 +863,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	bool gmode;
  	u32 tmp;
  
-@@ -3908,19 +4223,20 @@
+@@ -3917,19 +4232,20 @@ static int b43_switch_band(struct b43_wldev *dev,
  		return -ENODEV;
  	}
  
@@ -853,7 +887,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	b43_phy_put_into_reset(dev);
  	switch (dev->dev->bus_type) {
  #ifdef CONFIG_B43_BCMA
-@@ -3930,6 +4246,11 @@
+@@ -3939,6 +4255,11 @@ static int b43_switch_band(struct b43_wldev *dev,
  			tmp |= B43_BCMA_IOCTL_GMODE;
  		else
  			tmp &= ~B43_BCMA_IOCTL_GMODE;
@@ -865,7 +899,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  		bcma_awrite32(dev->dev->bdev, BCMA_IOCTL, tmp);
  		break;
  #endif
-@@ -3950,6 +4271,13 @@
+@@ -3959,6 +4280,13 @@ static int b43_switch_band(struct b43_wldev *dev,
  
  	b43_phy_init(dev);
  
@@ -879,7 +913,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	return 0;
  }
  
-@@ -3993,9 +4321,12 @@
+@@ -4002,9 +4330,12 @@ static int b43_op_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
  	if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
  		phy->chandef = &conf->chandef;
  		phy->channel = conf->chandef.chan->hw_value;
@@ -894,7 +928,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  		if (err)
  			goto out_mac_enable;
  
-@@ -4151,6 +4482,13 @@
+@@ -4160,6 +4491,13 @@ static void b43_op_bss_info_changed(struct ieee80211_hw *hw,
  			b43_short_slot_timing_disable(dev);
  	}
  
@@ -908,30 +942,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	b43_mac_enable(dev);
  out_unlock_mutex:
  	mutex_unlock(&wl->mutex);
-@@ -4213,7 +4551,8 @@
- 		algorithm = B43_SEC_ALGO_AES;
- 		break;
- 	default:
--		B43_WARN_ON(1);
-+		/* e.g. BIP (AES-CMAC) for MFP: mac80211 does it in software */
-+		err = -EOPNOTSUPP;
- 		goto out_unlock;
- 	}
- 	index = (u8) (key->keyidx);
-@@ -4257,6 +4596,12 @@
- 		key->flags |= IEEE80211_KEY_FLAG_GENERATE_IV;
- 		if (algorithm == B43_SEC_ALGO_TKIP)
- 			key->flags |= IEEE80211_KEY_FLAG_GENERATE_MMIC;
-+		/* The engine predates 802.11w and gets the CCMP of protected
-+		 * management frames wrong: the peer drops e.g. our ADDBA
-+		 * responses and SA Query replies. Let mac80211 do those.
-+		 */
-+		if (algorithm == B43_SEC_ALGO_AES)
-+			key->flags |= IEEE80211_KEY_FLAG_SW_MGMT_TX;
- 		break;
- 	case DISABLE_KEY: {
- 		err = b43_key_clear(dev, key->hw_key_idx);
-@@ -4857,6 +5202,15 @@
+@@ -4877,6 +5215,15 @@ static int b43_wireless_core_init(struct b43_wldev *dev)
  		goto err_busdown;
  	b43_shm_write16(dev, B43_SHM_SHARED,
  			B43_SHM_SH_WLCOREREV, dev->dev->core_rev);
@@ -947,7 +958,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	hf = b43_hf_read(dev);
  	if (phy->type == B43_PHYTYPE_G) {
  		hf |= B43_HF_SYMW;
-@@ -5131,6 +5485,7 @@
+@@ -5151,6 +5498,7 @@ static void b43_op_sw_scan_start_notifier(struct ieee80211_hw *hw,
  	struct b43_wldev *dev;
  
  	mutex_lock(&wl->mutex);
@@ -955,7 +966,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	dev = wl->current_dev;
  	if (dev && (b43_status(dev) >= B43_STAT_INITIALIZED)) {
  		/* Disable CFP update during scan on other channels. */
-@@ -5146,10 +5501,43 @@
+@@ -5166,10 +5514,43 @@ static void b43_op_sw_scan_complete_notifier(struct ieee80211_hw *hw,
  	struct b43_wldev *dev;
  
  	mutex_lock(&wl->mutex);
@@ -999,7 +1010,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	}
  	mutex_unlock(&wl->mutex);
  }
-@@ -5171,6 +5559,45 @@
+@@ -5191,6 +5572,45 @@ static int b43_op_get_survey(struct ieee80211_hw *hw, int idx,
  	return 0;
  }
  
@@ -1045,7 +1056,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  static const struct ieee80211_ops b43_hw_ops = {
  	.add_chanctx = ieee80211_emulate_add_chanctx,
  	.remove_chanctx = ieee80211_emulate_remove_chanctx,
-@@ -5197,6 +5624,8 @@
+@@ -5217,6 +5637,8 @@ static const struct ieee80211_ops b43_hw_ops = {
  	.sw_scan_complete	= b43_op_sw_scan_complete_notifier,
  	.get_survey		= b43_op_get_survey,
  	.rfkill_poll		= b43_rfkill_poll,
@@ -1054,7 +1065,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  };
  
  /* Hard-reset the chip. Do not call this directly.
-@@ -5224,6 +5653,24 @@
+@@ -5244,6 +5666,24 @@ static void b43_chip_reset(struct work_struct *work)
  	if (prev_status >= B43_STAT_INITIALIZED)
  		b43_wireless_core_exit(dev);
  
@@ -1079,7 +1090,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  	/* ...and up again. */
  	if (prev_status >= B43_STAT_INITIALIZED) {
  		err = b43_wireless_core_init(dev);
-@@ -5272,7 +5719,37 @@
+@@ -5292,7 +5732,37 @@ static int b43_setup_bands(struct b43_wldev *dev,
  	if (have_2ghz_phy)
  		hw->wiphy->bands[NL80211_BAND_2GHZ] = limited_2g ?
  			&b43_band_2ghz_limited : &b43_band_2GHz;
@@ -1118,7 +1129,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  		if (have_5ghz_phy)
  			hw->wiphy->bands[NL80211_BAND_5GHZ] = limited_5g ?
  				&b43_band_5GHz_nphy_limited :
-@@ -5427,9 +5904,16 @@
+@@ -5447,9 +5917,16 @@ static int b43_wireless_core_attach(struct b43_wldev *dev)
  	/* We don't support 5 GHz on some PHYs yet */
  	if (have_5ghz_phy) {
  		switch (dev->phy.type) {
@@ -1136,7 +1147,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  			b43warn(wl, "5 GHz band is unsupported on this PHY\n");
  			have_5ghz_phy = false;
  		}
-@@ -5579,6 +6063,8 @@
+@@ -5599,6 +6076,8 @@ static struct b43_wl *b43_wireless_init(struct b43_bus_dev *dev)
  	ieee80211_hw_set(hw, RX_INCLUDES_FCS);
  	ieee80211_hw_set(hw, SIGNAL_DBM);
  	ieee80211_hw_set(hw, MFP_CAPABLE);
@@ -1146,6 +1157,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/bro
  		BIT(NL80211_IFTYPE_AP) |
  		BIT(NL80211_IFTYPE_MESH_POINT) |
 diff --git a/drivers/net/wireless/broadcom/b43/main.h b/drivers/net/wireless/broadcom/b43/main.h
+index d94ab86e8495..df64efce31c4 100644
 --- a/drivers/net/wireless/broadcom/b43/main.h
 +++ b/drivers/net/wireless/broadcom/b43/main.h
 @@ -27,6 +27,7 @@
@@ -1157,9 +1169,10 @@ diff --git a/drivers/net/wireless/broadcom/b43/main.h b/drivers/net/wireless/bro
  /* Logmessage verbosity levels. Update the b43_modparam_verbose helptext, if
   * you add or remove levels. */
 diff --git a/drivers/net/wireless/broadcom/b43/phy_common.c b/drivers/net/wireless/broadcom/b43/phy_common.c
+index 285490f6f0a1..922e2eb4f1fd 100644
 --- a/drivers/net/wireless/broadcom/b43/phy_common.c
 +++ b/drivers/net/wireless/broadcom/b43/phy_common.c
-@@ -423,11 +423,17 @@
+@@ -423,11 +423,17 @@ int b43_switch_channel(struct b43_wldev *dev, unsigned int new_channel)
  	 * firmware from sending ghost packets.
  	 */
  	channelcookie = new_channel;
@@ -1181,9 +1194,10 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_common.c b/drivers/net/wirele
  	b43_shm_write16(dev, B43_SHM_SHARED, B43_SHM_SH_CHAN, channelcookie);
  
 diff --git a/drivers/net/wireless/broadcom/b43/phy_common.h b/drivers/net/wireless/broadcom/b43/phy_common.h
+index 5ec5233acf40..d993f0cb4ba7 100644
 --- a/drivers/net/wireless/broadcom/b43/phy_common.h
 +++ b/drivers/net/wireless/broadcom/b43/phy_common.h
-@@ -259,6 +259,15 @@
+@@ -259,6 +259,15 @@ struct b43_phy {
  	/* Current channel */
  	struct cfg80211_chan_def *chandef;
  	unsigned int channel;
@@ -1200,9 +1214,10 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_common.h b/drivers/net/wirele
  	/* PHY TX errors counter. */
  	atomic_t txerr_cnt;
 diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/broadcom/b43/phy_ht.c
+index cca3a5ebd8e5..df0ac8617109 100644
 --- a/drivers/net/wireless/broadcom/b43/phy_ht.c
 +++ b/drivers/net/wireless/broadcom/b43/phy_ht.c
-@@ -346,12 +346,18 @@
+@@ -346,12 +346,18 @@ static void b43_phy_ht_stop_playback(struct b43_wldev *dev)
  
  	b43_phy_mask(dev, B43_PHY_HT_SAMP_CMD, ~0x0004);
  
@@ -1215,14 +1230,13 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  		if (phy_ht->bb_mult_save[i] >= 0) {
  			b43_httab_write(dev, B43_HTTAB16(13, 0x63 + i * 4),
  					phy_ht->bb_mult_save[i]);
--			b43_httab_write(dev, B43_HTTAB16(13, 0x67 + i * 4),
-+			b43_httab_write(dev, B43_HTTAB16(13, 0x73 + i * 4),
+ 			b43_httab_write(dev, B43_HTTAB16(13, 0x73 + i * 4),
  					phy_ht->bb_mult_save[i]);
 +			phy_ht->bb_mult_save[i] = -1;
  		}
  	}
  }
-@@ -372,7 +378,7 @@
+@@ -372,7 +378,7 @@ static u16 b43_phy_ht_load_samples(struct b43_wldev *dev)
  }
  
  static void b43_phy_ht_run_samples(struct b43_wldev *dev, u16 samps, u16 loops,
@@ -1231,7 +1245,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  {
  	struct b43_phy_ht *phy_ht = dev->phy.ht;
  	u16 save_seq_mode;
-@@ -396,8 +402,14 @@
+@@ -396,8 +402,14 @@ static void b43_phy_ht_run_samples(struct b43_wldev *dev, u16 samps, u16 loops,
  	/* TODO: find out mask bits! Do we need more function arguments? */
  	b43_phy_mask(dev, B43_PHY_HT_SAMP_CMD, ~0);
  	b43_phy_mask(dev, B43_PHY_HT_SAMP_CMD, ~0);
@@ -1248,7 +1262,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  
  	for (i = 0; i < 100; i++) {
  		if (!(b43_phy_read(dev, B43_PHY_HT_RF_SEQ_STATUS) & 1)) {
-@@ -417,7 +429,7 @@
+@@ -417,7 +429,7 @@ static void b43_phy_ht_tx_tone(struct b43_wldev *dev)
  	u16 samp;
  
  	samp = b43_phy_ht_load_samples(dev);
@@ -1257,7 +1271,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  }
  
  /**************************************************
-@@ -446,7 +458,11 @@
+@@ -446,7 +458,11 @@ static void b43_phy_ht_rssi_select(struct b43_wldev *dev, u8 core_sel,
  				continue;
  
  			switch (rssi_type) {
@@ -1269,7 +1283,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  				b43_phy_set(dev, ctl_regs[core][0], 0x3 << 8);
  				b43_phy_set(dev, ctl_regs[core][0], 0x3 << 10);
  				b43_phy_set(dev, ctl_regs[core][1], 0x1 << 9);
-@@ -508,13 +524,28 @@
+@@ -508,13 +524,28 @@ static void b43_phy_ht_poll_rssi(struct b43_wldev *dev, enum ht_rssi_type type,
   * Tx/Rx
   **************************************************/
  
@@ -1299,23 +1313,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  
  		if (0) /* FIXME */
  			mask = 0x2 << (i * 4);
-@@ -546,25 +577,30 @@
- 
- 	if (!enable) {
- 		if (b43_phy_read(dev, B43_PHY_HT_TXPCTL_CMD_C1) & en_bits) {
--			/* We disable enabled TX pwr ctl, save it's state */
-+			/* We disable enabled TX pwr ctl, save it's state.
-+			 * The status registers hold the current gain index
-+			 * in bits 8-14; the low byte is the estimated output
-+			 * power (it settles at the target power).
-+			 */
- 			for (i = 0; i < 3; i++)
- 				phy_ht->tx_pwr_idx[i] =
--					b43_phy_read(dev, status_regs[i]);
-+					(b43_phy_read(dev, status_regs[i]) >> 8) &
-+					B43_PHY_HT_TXPCTL_CMD_C1_INIT;
- 		}
- 		b43_phy_mask(dev, B43_PHY_HT_TXPCTL_CMD_C1, 0xffff & ~en_bits);
+@@ -559,10 +590,6 @@ static void b43_phy_ht_tx_power_ctl(struct b43_wldev *dev, bool enable)
  	} else {
  		b43_phy_set(dev, B43_PHY_HT_TXPCTL_CMD_C1, en_bits);
  
@@ -1324,21 +1322,9 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
 -				b43_phy_write(dev, cmd_regs[i], 0x32);
 -		}
  
-+		/* Only replace the index field: a plain write would also
-+		 * clear the enable bits in CMD_C1 set above.
-+		 */
- 		for (i = 0; i < 3; i++)
- 			if (phy_ht->tx_pwr_idx[i] <=
- 			    B43_PHY_HT_TXPCTL_CMD_C1_INIT)
--				b43_phy_write(dev, cmd_regs[i],
--					      phy_ht->tx_pwr_idx[i]);
-+				b43_phy_maskset(dev, cmd_regs[i],
-+						~B43_PHY_HT_TXPCTL_CMD_C1_INIT,
-+						phy_ht->tx_pwr_idx[i]);
- 	}
- 
- 	phy_ht->tx_pwr_ctl = enable;
-@@ -591,7 +627,10 @@
+ 		/* Only replace the index field: a plain write would also
+ 		 * clear the enable bits in CMD_C1 set above.
+@@ -599,7 +626,10 @@ static void b43_phy_ht_tx_power_ctl_idle_tssi(struct b43_wldev *dev)
  
  	b43_phy_ht_tx_tone(dev);
  	udelay(20);
@@ -1350,7 +1336,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  	b43_phy_ht_stop_playback(dev);
  	b43_phy_ht_reset_cca(dev);
  
-@@ -618,6 +657,855 @@
+@@ -626,6 +656,855 @@ static void b43_phy_ht_tssi_setup(struct b43_wldev *dev)
  	}
  }
  
@@ -2206,7 +2192,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  static void b43_phy_ht_tx_power_ctl_setup(struct b43_wldev *dev)
  {
  	struct b43_phy_ht *phy_ht = dev->phy.ht;
-@@ -628,6 +1516,9 @@
+@@ -636,6 +1515,9 @@ static void b43_phy_ht_tx_power_ctl_setup(struct b43_wldev *dev)
  	s16 a1[3], b0[3], b1[3];
  
  	u16 freq = dev->phy.chandef->chan->center_freq;
@@ -2216,7 +2202,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  	int i, c;
  
  	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ) {
-@@ -672,12 +1563,37 @@
+@@ -680,12 +1562,37 @@ static void b43_phy_ht_tx_power_ctl_setup(struct b43_wldev *dev)
  	/* TODO: Does it depend on sprom->fem.ghz2.tssipos? */
  	b43_phy_set(dev, B43_PHY_HT_TXPCTL_IDLE_TSSI, 0x4000);
  
@@ -2257,24 +2243,15 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  
  	b43_phy_set(dev, B43_PHY_HT_TXPCTL_IDLE_TSSI,
  		    B43_PHY_HT_TXPCTL_IDLE_TSSI_BINF);
-@@ -714,13 +1630,14 @@
+@@ -722,6 +1629,7 @@ static void b43_phy_ht_tx_power_ctl_setup(struct b43_wldev *dev)
  
  	for (c = 0; c < 3; c++) {
  		s32 num, den, pwr;
--		u32 regval[64];
 +		/* Must match the 16-bit table width used for the upload below */
-+		u16 regval[64];
+ 		u16 regval[64];
  
  		for (i = 0; i < 64; i++) {
- 			num = 8 * (16 * b0[c] + b1[c] * i);
- 			den = 32768 + a1[c] * i;
- 			pwr = max((4 * num + den / 2) / den, -8);
--			regval[i] = pwr;
-+			regval[i] = (u16)pwr;
- 		}
- 		b43_httab_write_bulk(dev, B43_HTTAB16(26 + c, 0), 64, regval);
- 	}
-@@ -796,6 +1713,11 @@
+@@ -804,6 +1712,11 @@ static void b43_phy_ht_channel_setup(struct b43_wldev *dev,
  			b43_phy_mask(dev, B43_PHY_HT_TEST, ~0x840);
  	}
  
@@ -2286,7 +2263,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  	if (1) /* TODO: On N it's for early devices only, what about HT? */
  		b43_phy_ht_tx_power_fix(dev);
  
-@@ -804,29 +1726,106 @@
+@@ -812,29 +1725,106 @@ static void b43_phy_ht_channel_setup(struct b43_wldev *dev,
  	b43_phy_write(dev, 0x017e, 0x3830);
  }
  
@@ -2397,7 +2374,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  	} else {
  		return -ESRCH;
  	}
-@@ -854,9 +1853,19 @@
+@@ -862,9 +1852,19 @@ static void b43_phy_ht_op_prepare_structs(struct b43_wldev *dev)
  {
  	struct b43_phy *phy = &dev->phy;
  	struct b43_phy_ht *phy_ht = phy->ht;
@@ -2417,7 +2394,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  
  	phy_ht->tx_pwr_ctl = true;
  	for (i = 0; i < 3; i++)
-@@ -868,10 +1877,8 @@
+@@ -876,10 +1876,8 @@ static void b43_phy_ht_op_prepare_structs(struct b43_wldev *dev)
  
  static int b43_phy_ht_op_init(struct b43_wldev *dev)
  {
@@ -2428,7 +2405,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  
  	if (dev->dev->bus_type != B43_BUS_BCMA) {
  		b43err(dev->wl, "HT-PHY is supported only on BCMA bus!\n");
-@@ -954,7 +1961,11 @@
+@@ -962,7 +1960,11 @@ static int b43_phy_ht_op_init(struct b43_wldev *dev)
  	b43_httab_write_few(dev, B43_HTTAB16(40, 0x8), 4,
  			    0x09, 0x0e, 0x13, 0x18);
  
@@ -2441,7 +2418,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  	b43_phy_maskset(dev, B43_PHY_OFDM(0x64), 0x3f, 0xd);
  	b43_phy_maskset(dev, B43_PHY_OFDM(0xa4), 0x3f, 0xd);
  
-@@ -992,16 +2003,9 @@
+@@ -1000,16 +2002,9 @@ static int b43_phy_ht_op_init(struct b43_wldev *dev)
  	if (b43_current_band(dev->wl) == NL80211_BAND_2GHZ)
  		b43_phy_ht_bphy_init(dev);
  
@@ -2460,7 +2437,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  
  	return 0;
  }
-@@ -1031,7 +2035,14 @@
+@@ -1039,7 +2034,14 @@ static void b43_phy_ht_op_software_rfkill(struct b43_wldev *dev,
  		else
  			B43_WARN_ON(1);
  
@@ -2475,7 +2452,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  	}
  }
  
-@@ -1065,7 +2076,8 @@
+@@ -1073,7 +2075,8 @@ static int b43_phy_ht_op_switch_channel(struct b43_wldev *dev,
  		if ((new_channel < 1) || (new_channel > 14))
  			return -EINVAL;
  	} else {
@@ -2485,13 +2462,14 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.c b/drivers/net/wireless/b
  	}
  
  	return b43_phy_ht_set_channel(dev, channel, channel_type);
-@@ -1134,4 +2146,5 @@
+@@ -1142,4 +2145,5 @@ const struct b43_phy_operations b43_phyops_ht = {
  	.get_default_chan	= b43_phy_ht_op_get_default_chan,
  	.recalc_txpower		= b43_phy_ht_op_recalc_txpower,
  	.adjust_txpower		= b43_phy_ht_op_adjust_txpower,
 +	.pwork_60sec		= b43_phy_ht_op_pwork_60sec,
  };
 diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.h b/drivers/net/wireless/broadcom/b43/phy_ht.h
+index 046753857493..439f064709af 100644
 --- a/drivers/net/wireless/broadcom/b43/phy_ht.h
 +++ b/drivers/net/wireless/broadcom/b43/phy_ht.h
 @@ -17,6 +17,9 @@
@@ -2518,7 +2496,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.h b/drivers/net/wireless/b
  #define  B43_PHY_HT_TSSIMODE_EN			0x0001	/* TSSI enable */
  #define  B43_PHY_HT_TSSIMODE_PDEN		0x0002	/* Power det enable */
  #define B43_PHY_HT_BW1				0x1CE
-@@ -124,6 +134,16 @@
+@@ -124,6 +134,16 @@ struct b43_phy_ht_channeltab_e_phy {
  };
  
  
@@ -2535,7 +2513,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.h b/drivers/net/wireless/b
  struct b43_phy_ht {
  	u16 rf_ctl_int_save[3];
  
-@@ -131,6 +151,9 @@
+@@ -131,6 +151,9 @@ struct b43_phy_ht {
  	u8 tx_pwr_idx[3];
  
  	s32 bb_mult_save[3];
@@ -2545,7 +2523,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.h b/drivers/net/wireless/b
  
  	u8 idle_tssi[3];
  };
-@@ -139,4 +162,6 @@
+@@ -139,4 +162,6 @@ struct b43_phy_ht {
  struct b43_phy_operations;
  extern const struct b43_phy_operations b43_phyops_ht;
  
@@ -2553,9 +2531,10 @@ diff --git a/drivers/net/wireless/broadcom/b43/phy_ht.h b/drivers/net/wireless/b
 +
  #endif /* B43_PHY_HT_H_ */
 diff --git a/drivers/net/wireless/broadcom/b43/radio_2059.c b/drivers/net/wireless/broadcom/b43/radio_2059.c
+index d82fc9b1c166..995242373443 100644
 --- a/drivers/net/wireless/broadcom/b43/radio_2059.c
 +++ b/drivers/net/wireless/broadcom/b43/radio_2059.c
-@@ -54,6 +54,11 @@
+@@ -54,6 +54,11 @@ static u16 r2059_phy_rev1_init[][2] = {
  
  /* Extracted from MMIO dump of 6.30.223.141
   * TODO: Values for channels 12 & 13 are outdated (from some old 5.x driver)!
@@ -2567,164 +2546,165 @@ diff --git a/drivers/net/wireless/broadcom/b43/radio_2059.c b/drivers/net/wirele
   */
  static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radio2059[] = {
  	{
-@@ -153,6 +158,13 @@
+@@ -152,6 +157,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x0f, 0x4f, 0xa3, 0x00, 0xfc),
  		PHYREGS(0x081c, 0x0818, 0x0814, 0x01f9, 0x01fa, 0x01fb),
  	},
- 	{
++	{
 +		.freq			= 5190,
 +		RADIOREGS(0xc2, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x07,
 +			  0x02, 0x0c, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00,
 +			  0x0f, 0x4f, 0x93, 0x00, 0xfb),
 +		PHYREGS(0x0820, 0x081c, 0x0818, 0x01f8, 0x01f9, 0x01fa),
 +	},
-+	{
+ 	{
  		.freq			= 5200,
  		RADIOREGS(0xc5, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x08,
- 			  0x02, 0x0c, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00,
-@@ -167,6 +179,13 @@
+@@ -166,6 +178,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x0f, 0x4f, 0x93, 0x00, 0xea),
  		PHYREGS(0x082c, 0x0828, 0x0824, 0x01f5, 0x01f6, 0x01f7),
  	},
- 	{
++	{
 +		.freq			= 5230,
 +		RADIOREGS(0xcf, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x0b,
 +			  0x02, 0x0c, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00,
 +			  0x0f, 0x4f, 0x93, 0x00, 0xda),
 +		PHYREGS(0x0830, 0x082c, 0x0828, 0x01f4, 0x01f5, 0x01f6),
 +	},
-+	{
+ 	{
  		.freq			= 5240,
  		RADIOREGS(0xd2, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x0c,
- 			  0x02, 0x0c, 0x00, 0x0c, 0x00, 0x0c, 0x00, 0x00,
-@@ -181,6 +200,13 @@
+@@ -180,6 +199,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x0f, 0x4f, 0x93, 0x00, 0xca),
  		PHYREGS(0x083c, 0x0838, 0x0834, 0x01f1, 0x01f2, 0x01f3),
  	},
- 	{
++	{
 +		.freq			= 5270,
 +		RADIOREGS(0xdc, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x0f,
 +			  0x02, 0x0b, 0x00, 0x0b, 0x00, 0x0b, 0x00, 0x00,
 +			  0x0f, 0x4f, 0x93, 0x00, 0xb9),
 +		PHYREGS(0x0840, 0x083c, 0x0838, 0x01f0, 0x01f1, 0x01f2),
 +	},
-+	{
+ 	{
  		.freq			= 5280,
  		RADIOREGS(0xe0, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x10,
- 			  0x02, 0x0b, 0x00, 0x0b, 0x00, 0x0b, 0x00, 0x00,
-@@ -195,6 +221,13 @@
+@@ -194,6 +220,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x0f, 0x4c, 0x83, 0x00, 0xb8),
  		PHYREGS(0x084c, 0x0848, 0x0844, 0x01ee, 0x01ef, 0x01f0),
  	},
- 	{
++	{
 +		.freq			= 5310,
 +		RADIOREGS(0xea, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x13,
 +			  0x02, 0x0b, 0x00, 0x0b, 0x00, 0x0b, 0x00, 0x00,
 +			  0x0f, 0x4c, 0x83, 0x00, 0xa8),
 +		PHYREGS(0x0850, 0x084c, 0x0848, 0x01ed, 0x01ee, 0x01ef),
 +	},
-+	{
+ 	{
  		.freq			= 5320,
  		RADIOREGS(0xed, 0x16, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x14,
- 			  0x02, 0x0b, 0x00, 0x0b, 0x00, 0x0b, 0x00, 0x00,
-@@ -209,6 +242,13 @@
+@@ -208,6 +241,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x0a, 0x46, 0x43, 0x00, 0x75),
  		PHYREGS(0x089c, 0x0898, 0x0894, 0x01dc, 0x01dd, 0x01dd),
  	},
- 	{
++	{
 +		.freq			= 5510,
 +		RADIOREGS(0x2c, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x27,
 +			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
 +			  0x0a, 0x46, 0x43, 0x00, 0x75),
 +		PHYREGS(0x08a0, 0x089c, 0x0898, 0x01db, 0x01dc, 0x01dc),
 +	},
-+	{
+ 	{
  		.freq			= 5520,
  		RADIOREGS(0x30, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x28,
- 			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
-@@ -223,6 +263,13 @@
+@@ -222,6 +262,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x0a, 0x46, 0x43, 0x00, 0x75),
  		PHYREGS(0x08ac, 0x08a8, 0x08a4, 0x01d8, 0x01d9, 0x01da),
  	},
- 	{
++	{
 +		.freq			= 5550,
 +		RADIOREGS(0x3a, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x2b,
 +			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
 +			  0x0a, 0x46, 0x43, 0x00, 0x75),
 +		PHYREGS(0x08b0, 0x08ac, 0x08a8, 0x01d7, 0x01d8, 0x01d9),
 +	},
-+	{
+ 	{
  		.freq			= 5560,
  		RADIOREGS(0x3d, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x2c,
- 			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
-@@ -237,6 +284,13 @@
+@@ -236,6 +283,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x0a, 0x46, 0x43, 0x00, 0x74),
  		PHYREGS(0x08bc, 0x08b8, 0x08b4, 0x01d5, 0x01d6, 0x01d7),
  	},
- 	{
++	{
 +		.freq			= 5590,
 +		RADIOREGS(0x47, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x2f,
 +			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
 +			  0x09, 0x44, 0x23, 0x00, 0x54),
 +		PHYREGS(0x08c0, 0x08bc, 0x08b8, 0x01d4, 0x01d5, 0x01d6),
 +	},
-+	{
+ 	{
  		.freq			= 5600,
  		RADIOREGS(0x4a, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x30,
- 			  0x02, 0x08, 0x00, 0x08, 0x00, 0x08, 0x00, 0x00,
-@@ -251,6 +305,13 @@
+@@ -250,6 +304,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x09, 0x44, 0x23, 0x00, 0x54),
  		PHYREGS(0x08cc, 0x08c8, 0x08c4, 0x01d2, 0x01d2, 0x01d3),
  	},
- 	{
++	{
 +		.freq			= 5630,
 +		RADIOREGS(0x54, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x33,
 +			  0x02, 0x07, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00,
 +			  0x09, 0x44, 0x23, 0x00, 0x43),
 +		PHYREGS(0x08d0, 0x08cc, 0x08c8, 0x01d1, 0x01d1, 0x01d2),
 +	},
-+	{
+ 	{
  		.freq			= 5640,
  		RADIOREGS(0x58, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x34,
- 			  0x02, 0x07, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00,
-@@ -265,6 +326,13 @@
+@@ -264,6 +325,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x09, 0x43, 0x23, 0x00, 0x43),
  		PHYREGS(0x08dc, 0x08d8, 0x08d4, 0x01ce, 0x01cf, 0x01d0),
  	},
- 	{
++	{
 +		.freq			= 5670,
 +		RADIOREGS(0x62, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x37,
 +			  0x02, 0x07, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00,
 +			  0x09, 0x42, 0x23, 0x00, 0x43),
 +		PHYREGS(0x08e0, 0x08dc, 0x08d8, 0x01cd, 0x01ce, 0x01cf),
 +	},
-+	{
+ 	{
  		.freq			= 5680,
  		RADIOREGS(0x65, 0x17, 0x10, 0x1f, 0x08, 0x08, 0x3f, 0x38,
- 			  0x02, 0x07, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00,
-@@ -286,6 +354,13 @@
+@@ -285,6 +353,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x08, 0x42, 0x13, 0x00, 0x21),
  		PHYREGS(0x08fe, 0x08fa, 0x08f6, 0x01c8, 0x01c8, 0x01c9),
  	},
- 	{
++	{
 +		.freq			= 5755,
 +		RADIOREGS(0x7e, 0x17, 0x20, 0x1f, 0x08, 0x08, 0x3f, 0x7f,
 +			  0x04, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00,
 +			  0x08, 0x42, 0x13, 0x00, 0x11),
 +		PHYREGS(0x0902, 0x08fe, 0x08fa, 0x01c7, 0x01c7, 0x01c8),
 +	},
-+	{
+ 	{
  		.freq			= 5765,
  		RADIOREGS(0x81, 0x17, 0x20, 0x1f, 0x08, 0x08, 0x3f, 0x81,
- 			  0x04, 0x06, 0x00, 0x06, 0x00, 0x06, 0x00, 0x00,
-@@ -300,6 +375,13 @@
+@@ -299,6 +374,13 @@ static const struct b43_phy_ht_channeltab_e_radio2059 b43_phy_ht_channeltab_radi
+ 			  0x08, 0x42, 0x13, 0x00, 0x00),
  		PHYREGS(0x090e, 0x090a, 0x0906, 0x01c4, 0x01c5, 0x01c6),
  	},
- 	{
++	{
 +		.freq			= 5795,
 +		RADIOREGS(0x8b, 0x17, 0x20, 0x1f, 0x08, 0x08, 0x3f, 0x87,
 +			  0x04, 0x05, 0x00, 0x05, 0x00, 0x05, 0x00, 0x00,
 +			  0x06, 0x41, 0x03, 0x00, 0x00),
 +		PHYREGS(0x0912, 0x090e, 0x090a, 0x01c3, 0x01c4, 0x01c5),
 +	},
-+	{
+ 	{
  		.freq			= 5805,
  		RADIOREGS(0x8f, 0x17, 0x20, 0x1f, 0x08, 0x08, 0x3f, 0x89,
- 			  0x04, 0x05, 0x00, 0x05, 0x00, 0x05, 0x00, 0x00,
 diff --git a/drivers/net/wireless/broadcom/b43/tables_phy_ht.c b/drivers/net/wireless/broadcom/b43/tables_phy_ht.c
+index 3b91bfffb09e..7ec1f027d8ce 100644
 --- a/drivers/net/wireless/broadcom/b43/tables_phy_ht.c
 +++ b/drivers/net/wireless/broadcom/b43/tables_phy_ht.c
-@@ -108,13 +108,16 @@
+@@ -108,13 +108,16 @@ static const u32 b43_httab_0x25[] = {
  	0x00000000, 0x00000000, 0x00000000, 0x00000000,
  };
  
@@ -2747,7 +2727,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/tables_phy_ht.c b/drivers/net/wir
  };
  
  static const u16 b43_httab_0x1a[] = {
-@@ -599,6 +602,46 @@
+@@ -599,6 +602,46 @@ const u32 b43_httab_0x1a_0xc0_late[] = {
  	0x10090001, 0x10090001, 0x10090001, 0x10090001,
  };
  
@@ -2794,37 +2774,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/tables_phy_ht.c b/drivers/net/wir
  /**************************************************
   * R/W ops.
   **************************************************/
-@@ -621,10 +664,13 @@
- 		value = b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
- 		break;
- 	case B43_HTTAB_32BIT:
-+		/* Reading DATALO latches the high half into DATAHI (and
-+		 * advances the address); reading DATAHI first returns
-+		 * whatever the previous access left there.
-+		 */
- 		b43_phy_write(dev, B43_PHY_HT_TABLE_ADDR, offset);
--		value = b43_phy_read(dev, B43_PHY_HT_TABLE_DATAHI);
--		value <<= 16;
--		value |= b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
-+		value = b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
-+		value |= b43_phy_read(dev, B43_PHY_HT_TABLE_DATAHI) << 16;
- 		break;
- 	default:
- 		B43_WARN_ON(1);
-@@ -658,9 +704,9 @@
- 			data += 2;
- 			break;
- 		case B43_HTTAB_32BIT:
--			*((u32 *)data) = b43_phy_read(dev, B43_PHY_HT_TABLE_DATAHI);
--			*((u32 *)data) <<= 16;
--			*((u32 *)data) |= b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
-+			/* Low half first, see b43_httab_read() */
-+			*((u32 *)data) = b43_phy_read(dev, B43_PHY_HT_TABLE_DATALO);
-+			*((u32 *)data) |= b43_phy_read(dev, B43_PHY_HT_TABLE_DATAHI) << 16;
- 			data += 4;
- 			break;
- 		default:
-@@ -795,6 +841,8 @@
+@@ -796,6 +839,8 @@ void b43_phy_ht_tables_init(struct b43_wldev *dev)
  {
  	BUILD_BUG_ON(ARRAY_SIZE(b43_httab_0x1a_0xc0_late) !=
  			B43_HTTAB_1A_C0_LATE_SIZE);
@@ -2834,9 +2784,10 @@ diff --git a/drivers/net/wireless/broadcom/b43/tables_phy_ht.c b/drivers/net/wir
  	httab_upload(dev, B43_HTTAB16(0x12, 0), b43_httab_0x12);
  	httab_upload(dev, B43_HTTAB16(0x27, 0), b43_httab_0x27);
 diff --git a/drivers/net/wireless/broadcom/b43/tables_phy_ht.h b/drivers/net/wireless/broadcom/b43/tables_phy_ht.h
+index 7ed057118ae3..f71b4b4c2277 100644
 --- a/drivers/net/wireless/broadcom/b43/tables_phy_ht.h
 +++ b/drivers/net/wireless/broadcom/b43/tables_phy_ht.h
-@@ -23,5 +23,6 @@
+@@ -23,5 +23,6 @@ void b43_phy_ht_tables_init(struct b43_wldev *dev);
  
  #define B43_HTTAB_1A_C0_LATE_SIZE		128
  extern const u32 b43_httab_0x1a_0xc0_late[];
@@ -2844,6 +2795,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/tables_phy_ht.h b/drivers/net/wir
  
  #endif /* B43_TABLES_PHY_HT_H_ */
 diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/broadcom/b43/xmit.c
+index 4de6e5042c55..93b25e87b10c 100644
 --- a/drivers/net/wireless/broadcom/b43/xmit.c
 +++ b/drivers/net/wireless/broadcom/b43/xmit.c
 @@ -15,6 +15,7 @@
@@ -2854,7 +2806,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  #include "phy_common.h"
  #include "dma.h"
  #include "pio.h"
-@@ -173,7 +174,9 @@
+@@ -173,7 +174,9 @@ static u16 b43_generate_tx_phy_ctl1(struct b43_wldev *dev, u8 bitrate)
  
  	if (phy->type == B43_PHYTYPE_LP)
  		bw = B43_TXH_PHY1_BW_20;
@@ -2865,18 +2817,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  		bw = B43_TXH_PHY1_BW_20;
  
  	if (0) { /* FIXME: MIMO */
-@@ -186,12 +189,152 @@
- 			control |= e->coding_rate;
- 			control |= e->modulation;
- 		}
-+		/* On HT-PHY this bit makes the frame undecodable, see
-+		 * b43_ht_phy_ctl3; the PHY takes the rate from the PLCP.
-+		 */
-+		if (phy->type == B43_PHYTYPE_HT)
-+			control &= ~B43_TXH_PHY1_CRATE_2_3;
- 		control |= B43_TXH_PHY1_MODE_SISO;
- 	}
- 
+@@ -197,6 +200,141 @@ static u16 b43_generate_tx_phy_ctl1(struct b43_wldev *dev, u8 bitrate)
  	return control;
  }
  
@@ -3018,7 +2959,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  static u8 b43_calc_fallback_rate(u8 bitrate, int gmode)
  {
  	switch (bitrate) {
-@@ -258,25 +401,74 @@
+@@ -263,25 +401,74 @@ int b43_generate_txhdr(struct b43_wldev *dev,
  	u8 extra_ft = 0;
  	struct ieee80211_rate *txrate;
  	struct ieee80211_tx_rate *rates;
@@ -3099,7 +3040,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  	    (wlhdr->duration_id & cpu_to_le16(0x8000)) ||
  	    (wlhdr->duration_id == cpu_to_le16(0))) {
  		/* If the fallback rate equals the normal rate or the
-@@ -339,8 +531,13 @@
+@@ -344,8 +531,13 @@ int b43_generate_txhdr(struct b43_wldev *dev,
  	}
  	switch (dev->fw.hdr_format) {
  	case B43_FW_HDR_598:
@@ -3115,7 +3056,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  		break;
  	case B43_FW_HDR_351:
  		b43_generate_plcp_hdr((struct b43_plcp_hdr4 *)(&txhdr->format_351.plcp),
-@@ -351,11 +548,17 @@
+@@ -356,11 +548,17 @@ int b43_generate_txhdr(struct b43_wldev *dev,
  				      plcp_fragment_len, rate);
  		break;
  	}
@@ -3136,7 +3077,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  		extra_ft |= B43_TXH_EFT_FB_OFDM;
  	else
  		extra_ft |= B43_TXH_EFT_FB_CCK;
-@@ -364,10 +567,12 @@
+@@ -369,10 +567,12 @@ int b43_generate_txhdr(struct b43_wldev *dev,
  	 * this value before comparing it to the value in SHM, if this
  	 * is a 5Ghz packet.
  	 */
@@ -3151,7 +3092,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  		phy_ctl |= B43_TXH_PHY_ENC_OFDM;
  	else
  		phy_ctl |= B43_TXH_PHY_ENC_CCK;
-@@ -393,6 +598,18 @@
+@@ -398,6 +598,18 @@ int b43_generate_txhdr(struct b43_wldev *dev,
  	default:
  		B43_WARN_ON(1);
  	}
@@ -3170,7 +3111,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  
  	rates = info->control.rates;
  	/* MAC control */
-@@ -553,11 +770,21 @@
+@@ -558,11 +770,21 @@ int b43_generate_txhdr(struct b43_wldev *dev,
  	}
  
  	if (fill_phy_ctl1) {
@@ -3178,14 +3119,13 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
 -			cpu_to_le16(b43_generate_tx_phy_ctl1(dev, rate));
 -		txhdr->phy_ctl1_fb =
 -			cpu_to_le16(b43_generate_tx_phy_ctl1(dev, rate_fb));
--	}
 +		txhdr->phy_ctl1 = cpu_to_le16(mcs ?
 +			b43_ht_tx_phy_ctl1(dev, mcs_idx, ht40) :
 +			b43_generate_tx_phy_ctl1(dev, rate));
 +		txhdr->phy_ctl1_fb = cpu_to_le16(mcs_fb ?
 +			b43_ht_tx_phy_ctl1(dev, mcs_fb_idx, ht40_fb) :
 +			b43_generate_tx_phy_ctl1(dev, rate_fb));
-+	}
+ 	}
 +	if (mcs)
 +		txhdr->mimo_modelen =
 +			cpu_to_le16(b43_ht_lsig_len(mcs_idx, plcp_fragment_len,
@@ -3197,7 +3137,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  
  	/* Apply the bitfields */
  	txhdr->mac_ctl = cpu_to_le32(mac_ctl);
-@@ -741,11 +968,31 @@
+@@ -746,11 +968,31 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
  		break;
  	}
  
@@ -3231,7 +3171,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  	if (unlikely(rate_idx == -1)) {
  		/* PLCP seems to be corrupted.
  		 * Drop the frame, if we are not interested in corrupted frames. */
-@@ -798,6 +1045,9 @@
+@@ -803,6 +1045,9 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
  			status.band = NL80211_BAND_2GHZ;
  		status.freq =
  			ieee80211_channel_to_frequency(chanid, status.band);
@@ -3241,7 +3181,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  		break;
  	default:
  		B43_WARN_ON(1);
-@@ -820,9 +1070,13 @@
+@@ -825,9 +1070,13 @@ void b43_handle_txstatus(struct b43_wldev *dev,
  {
  	b43_debugfs_log_txstat(dev, status);
  
@@ -3258,9 +3198,10 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/bro
  	if (!status->acked)
  		dev->wl->ieee_stats.dot11ACKFailureCount++;
 diff --git a/drivers/net/wireless/broadcom/b43/xmit.h b/drivers/net/wireless/broadcom/b43/xmit.h
+index 6524a75bb73b..4f751271846f 100644
 --- a/drivers/net/wireless/broadcom/b43/xmit.h
 +++ b/drivers/net/wireless/broadcom/b43/xmit.h
-@@ -221,6 +221,12 @@
+@@ -221,6 +221,12 @@ struct b43_txstatus {
  	u8 intermediate;	/* Intermediate status notification (not final) */
  	u8 for_ampdu;		/* Status is for an AMPDU (afterburner) */
  	u8 acked;		/* Wireless ACK received */
@@ -3273,7 +3214,7 @@ diff --git a/drivers/net/wireless/broadcom/b43/xmit.h b/drivers/net/wireless/bro
  };
  
  /* txstatus supp_reason values */
-@@ -356,6 +362,19 @@
+@@ -356,6 +362,19 @@ void b43_generate_plcp_hdr(struct b43_plcp_hdr4 *plcp,
  
  void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr);
  
