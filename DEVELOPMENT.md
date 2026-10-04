@@ -25,8 +25,15 @@ make O=../linux-build olddefconfig prepare
 1. Change the code as commits on the `b43-ht` branch. Fixes meant for
    upstream go first, each self-contained (it builds and works without the
    later patches), in kernel style: `wifi: b43: ...` subject, a description
-   of the problem and its effect, `Fixes:` where a commit introduced it,
-   `Signed-off-by:`. Everything else stays in the last patch until split out.
+   of the problem and its effect, `Fixes:` where a commit introduced it.
+   Everything else stays in the last patch until split out.
+
+   Much of this work was done with an AI coding assistant. Per
+   Documentation/process/coding-assistants.rst and generated-content.rst,
+   commits carry an `Assisted-by:` tag and the assistant never adds
+   `Signed-off-by:`: the human submitter reviews each patch and signs it off
+   (`git rebase --signoff <base>`) right before sending, and the cover
+   letter says which parts were tool-assisted and how they were tested.
 2. Check every commit builds and is checkpatch-clean:
    `B=../linux-build ../b43-ht/tools/kbuild-check.sh origin/main..b43-ht`
 3. Export: `../b43-ht/tools/export-series.sh . origin/main`

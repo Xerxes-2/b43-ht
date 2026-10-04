@@ -14,7 +14,7 @@ every channel switch and copies the high half of a TX gain table entry
 into the per-core TX gain table. That got a stale value.
 
 Fixes: 1a9313923718 ("b43: HT-PHY: prepare place for HT-PHY tables")
-Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/tables_phy_ht.c | 13 +++++++------
  1 file changed, 7 insertions(+), 6 deletions(-)

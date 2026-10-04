@@ -19,7 +19,7 @@ a PHY reset, when nothing has been saved yet; the bugs would show as
 soon as it is disabled and re-enabled around anything else.
 
 Fixes: 418e8b680516 ("b43: HT-PHY: store TX power state before disabling it")
-Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/phy_ht.c | 16 ++++++++++++----
  1 file changed, 12 insertions(+), 4 deletions(-)

@@ -3,23 +3,31 @@ From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 13:09:48 +1100
 Subject: [PATCH 1/8] wifi: b43: HT-PHY: fix the TX power estimate table upload
 
-The table of estimated output power per TSSI value was built as an
-array of u32 but uploaded with a 16-bit bulk write, which steps through
-the buffer two bytes at a time. Each core's 64-entry table thus got the
-low and high halves of the first 32 values: entry 2k held the estimate
-for TSSI k and every odd entry 0 (read back from the hardware). Closed-
-loop TX power control, which is enabled by default, works from these
-estimates.
+b43_phy_ht_tx_power_ctl_setup() builds the table of estimated output
+power per TSSI value as an array of u32, like its N-PHY counterpart
+b43_nphy_tx_power_ctl_setup() and brcmsmac's
+wlc_phy_txpwrctrl_pwr_setup_nphy(). Those upload it with 32-bit table
+writes; the HT-PHY version uploads it with a 16-bit bulk write, which
+steps through the buffer two bytes at a time. Each core's 64-entry
+table thus got the low and high halves of the first 32 values: entry
+2k held the estimate for TSSI k and every odd entry 0 (read back from
+the hardware). Closed-loop TX power control, which is enabled by
+default, works from these estimates.
 
-On a BCM4331 at 2.4 GHz, close to the AP, fixing the table lowers the
-signal seen by a monitor by 4-5 dB, and the higher OFDM rates start
+The tables are 16 bits wide: an MMIO trace of Broadcom's wl driver
+(6.30.223.271) on the same BCM4331 writes each of them as 64 16-bit
+entries, and after this change the values read back from the hardware
+match the ones wl writes.
+
+On that BCM4331 at 2.4 GHz, close to the AP, fixing the table lowers
+the signal seen by a monitor by 4-5 dB, and the higher OFDM rates start
 working: minstrel's success rate at 36 Mbit/s goes from about 40% to
 84%, at 54 Mbit/s from about 31% to 60%.
 
 Build the table as u16.
 
 Fixes: 5949e0406041 ("b43: HT-PHY: setup TX power control")
-Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/phy_ht.c | 4 ++--
  1 file changed, 2 insertions(+), 2 deletions(-)

@@ -6,18 +6,22 @@ Subject: [PATCH 2/8] wifi: b43: HT-PHY: don't flag coding rate 2/3 in PHY
 
 With B43_TXH_PHY1_CRATE_2_3 set, the HT-PHY transmits frames that no
 receiver decodes, and reports no error. Among legacy rates this bit is
-only used for 48 Mbit/s. On a BCM4331 at 2.4 GHz, a monitor next to it
-decoded none of the ~2500 frames minstrel tried at 48 Mbit/s in 40
-seconds, while it did decode 54 Mbit/s ones; with the bit cleared it
-decoded 124. Rate control never learns to avoid the rate: the
-retransmissions at the fallback rate succeed, and minstrel keeps
-crediting 48 Mbit/s with about 30% success.
+only used for 48 Mbit/s, as in brcmsmac's legacy_phycfg_table for the
+N-PHY. On a BCM4331 at 2.4 GHz, a monitor next to it decoded none of
+the ~2500 frames minstrel tried at 48 Mbit/s in 40 seconds, while it
+did decode 54 Mbit/s ones; with the bit cleared it decoded 124. Rate
+control never learns to avoid the rate: the retransmissions at the
+fallback rate succeed, and minstrel keeps crediting 48 Mbit/s with
+about 30% success.
 
-Sweeping the coding rate field shows the HT-PHY takes the rate from the
-PLCP header: any even value transmits correct frames, any odd value
-fails. Clear the bit on HT-PHY only; brcmsmac sets it on N-PHY.
+The problem is the bit, not the rate: with HT rates (not supported by
+b43 yet), setting it as brcmsmac's mcs_table does for the coding rate
+2/3 MCSs makes MCS 5 and 13 fail the same way. Sweeping the coding
+rate field shows the HT-PHY takes the rate from the PLCP header: any
+even value transmits correct frames, any odd value fails. Clear the bit
+on HT-PHY only.
 
-Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/xmit.c | 5 +++++
  1 file changed, 5 insertions(+)

@@ -6,23 +6,29 @@ Subject: [PATCH 4/8] wifi: b43: encrypt protected management frames in
 
 With management frame protection, unicast robust management frames
 (action frames such as SA Query and Radio Measurement, deauthentication,
-disassociation) are CCMP-protected. When the key is in hardware, b43's
-crypto engine encrypts them as if they were QoS data frames: decrypting
-frames captured from a BCM4331 shows a CCM nonce without the Management
-flag, and an AAD with the subtype bits masked and a zero QoS Control
-field appended (the subtypes of Action and Deauthentication frames have
-the bit that marks a QoS data frame). The peer can't decrypt them.
+disassociation) are CCMP-protected. For those, the CCM nonce has the
+Management flag set and the AAD keeps the frame's subtype bits (IEEE
+Std 802.11-2020, 12.5.3.3.3 and 12.5.3.3.4; ccmp_special_blocks() in
+mac80211). When the key is in hardware, b43's crypto engine encrypts
+them as if they were QoS data frames instead: decrypting frames
+captured from a BCM4331 shows a nonce without the Management flag, and
+an AAD with the subtype bits masked and a zero QoS Control field
+appended (the subtypes of Action and Deauthentication frames have the
+bit that marks a QoS data frame). The peer can't decrypt them.
 
 Against an AP with PMF, the AP got no usable response to its SA Query
 and Radio Measurement requests, and after a disconnect and reconnect it
 started an SA Query procedure, apparently having missed our protected
-Deauthentication.
+Deauthentication. With this change all of them decrypt correctly.
 
 Set IEEE80211_KEY_FLAG_SW_MGMT_TX on CCMP keys so that mac80211
 encrypts management frames itself; data frames still use the hardware.
+carl9170, ath5k, rtlwifi and mt76x02 do the same for crypto engines
+that can't handle it, see e.g. commit 23405236460b ("mt76: fix
+transmission of encrypted management frames").
 
 Fixes: 75d057bda1fb ("b43: Fix connection problem with WPA3")
-Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/main.c | 5 +++++
  1 file changed, 5 insertions(+)

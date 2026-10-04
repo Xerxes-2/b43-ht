@@ -15,10 +15,16 @@ mac80211 logs
 on every connection before falling back to software crypto.
 
 Return -EOPNOTSUPP, which tells mac80211 to do the cipher in software
-without complaint.
+without complaint (see "Hardware crypto acceleration" in mac80211.h
+and ieee80211_key_enable_hw_accel()), as ath5k and ath9k do; ath5k had
+the same warning, removed in commit a70e1d6fd6b5 ("ath5k: drop bogus
+warning on drv_set_key with unsupported cipher").
+
+Tested on a BCM4331 against an AP with optional PMF: the warning and
+the error message are gone, BIP is done in software as before.
 
 Fixes: 75d057bda1fb ("b43: Fix connection problem with WPA3")
-Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/main.c | 3 ++-
  1 file changed, 2 insertions(+), 1 deletion(-)

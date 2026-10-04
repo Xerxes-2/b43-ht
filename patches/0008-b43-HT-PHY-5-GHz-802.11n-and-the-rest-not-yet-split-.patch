@@ -10,7 +10,7 @@ receive), per-channel PHY settings, and further fixes still to be split
 out (controller restart, PM bit during scans, slot time on band
 switch, ...). See NOTES.md in https://github.com/Xerxes-2/b43-ht.
 
-Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/b43.h       |   18 +
  drivers/net/wireless/broadcom/b43/dma.c       |  273 ++++-

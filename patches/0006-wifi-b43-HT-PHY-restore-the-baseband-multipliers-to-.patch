@@ -16,7 +16,7 @@ the damage is short-lived; it would not be with any later use of tone
 playback (e.g. calibration).
 
 Fixes: 371ec465a358 ("b43: HT-PHY: implement stopping sample tone playback")
-Signed-off-by: Shupeng Xue <dspxue@gmail.com>
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/phy_ht.c | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)
