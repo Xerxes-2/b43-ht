@@ -639,8 +639,26 @@ Cap on the A-MPDU length at MCS 14/15 (> 250 Mbit/s), same position, alternating
 | 24 KB | 0–14 | 191–197 | 142–145 |
 | 16 KB | 0–9 | 174–176 | 118–121 |
 
-wl at the same position: UDP 176, TCP 75. To do: check a cap at close range (where 64 KB A-MPDUs gave UDP 220 without
-underflows), then choose between a fixed cap and brcmsmac-style adaptation from txfunfl.
+wl at the same position: UDP 176, TCP 75.
+
+Two candidates, kept on branches in the kernel tree (not in the series yet):
+- `ufl-cap`: fixed 24 KB above 250 Mbit/s.
+- `ufl-adapt`: per bandwidth and MCS, an underflow cuts the limit to 3/4 of the lost A-MPDU (floor 8 KB), each A-MPDU that
+  reached the limit raises it by 8 bytes. The underflow status is suppress reason 3 (B43_TXST_SUPP_PREV); _UNDER (6) never
+  shows up, and brcmsmac likewise treats TX_STATUS_SUPR_FRAG on an A-MPDU as the underflow event.
+
+Same position (-59 dBm), alternating, two runs of each per load, Mbit/s:
+
+| | underflows / 10 s | UDP TX | TCP TX |
+|---|---|---|---|
+| none | 337–609 | 163–176 | 61–74 |
+| `ufl-cap` | 0–95 | 186–203 | 122–148 |
+| `ufl-adapt` | 13–19 | 183–197 | 129–140 |
+
+`ufl-adapt` settles at 14–35 KB for MCS 14/15 here. To do: compare both at close range (64 KB A-MPDUs gave UDP 220 there,
+with no underflows), then pick one.
+
+PHY TX errors are now logged as a count every 15 s instead of one rate-limited message each (patch 0009).
 
 ## Next steps
 

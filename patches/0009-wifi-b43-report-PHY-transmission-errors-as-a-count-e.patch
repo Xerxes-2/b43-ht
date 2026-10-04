@@ -1,0 +1,58 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 21:00:55 +1100
+Subject: [PATCH wireless-next 9/9] wifi: b43: report PHY transmission errors
+ as a count every 15 s
+
+Each B43_IRQ_PHY_TXERR logged "PHY transmission error" through the
+driver's message rate limit. They come in bursts of dozens per second
+(e.g. TX FIFO underflows), so the log shows a few of them and hides how
+many there really are.
+
+The interrupt handler already counts them to restart the controller
+after B43_PHY_TX_BADNESS_LIMIT within 15 s; report that count from the
+15 s periodic work instead, once.
+
+Assisted-by: pi:claude-opus-5-5
+---
+ drivers/net/wireless/broadcom/b43/main.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 9d39f877303a..f0d0d33d3fdd 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -2098,7 +2098,10 @@ static void b43_do_interrupt_thread(struct b43_wldev *dev)
+ 		b43err(dev->wl, "MAC transmission error\n");
+ 
+ 	if (unlikely(reason & B43_IRQ_PHY_TXERR)) {
+-		b43err(dev->wl, "PHY transmission error\n");
++		/* Counted and reported every 15 s by b43_periodic_every15sec():
++		 * they can come by the dozen per second, which the rate limit
++		 * of a message per error would mostly hide.
++		 */
+ 		rmb();
+ 		if (unlikely(atomic_dec_and_test(&dev->phy.txerr_cnt))) {
+ 			atomic_set(&dev->phy.txerr_cnt,
+@@ -3492,6 +3495,7 @@ static void b43_periodic_every30sec(struct b43_wldev *dev)
+ static void b43_periodic_every15sec(struct b43_wldev *dev)
+ {
+ 	struct b43_phy *phy = &dev->phy;
++	int txerr;
+ 	u16 wdr;
+ 
+ 	if (dev->fw.opensource) {
+@@ -3511,8 +3515,12 @@ static void b43_periodic_every15sec(struct b43_wldev *dev)
+ 	if (phy->ops->pwork_15sec)
+ 		phy->ops->pwork_15sec(dev);
+ 
+-	atomic_set(&phy->txerr_cnt, B43_PHY_TX_BADNESS_LIMIT);
++	txerr = B43_PHY_TX_BADNESS_LIMIT -
++		atomic_xchg(&phy->txerr_cnt, B43_PHY_TX_BADNESS_LIMIT);
+ 	wmb();
++	if (txerr > 0)
++		b43err(dev->wl, "%d PHY transmission errors in the last 15 s\n",
++		       txerr);
+ 
+ #if B43_DEBUG
+ 	if (b43_debug(dev, B43_DBG_VERBOSESTATS)) {
