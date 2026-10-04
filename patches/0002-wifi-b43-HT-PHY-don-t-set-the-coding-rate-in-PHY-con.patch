@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Sun, 4 Oct 2026 13:11:23 +1100
+Subject: [PATCH wireless-next 2/8] wifi: b43: HT-PHY: don't set the coding
+ rate in PHY control word 1
+
+The HT-PHY takes the coding rate of a frame from the PLCP header, not
+from the coding rate field of PHY control word 1 in the TX header. The
+field's lowest bit, coding rate 2/3 on other PHYs, does something else:
+with it set, the HT-PHY transmits frames that no receiver decodes, and
+reports no error.
+
+Among legacy rates, only 48 Mbit/s has coding rate 2/3. On a BCM4331 at
+2.4 GHz, a monitor next to it decoded none of the ~2500 frames minstrel
+tried at 48 Mbit/s in 40 seconds, but did decode 54 Mbit/s ones; with
+this change it decoded about 200. Rate control doesn't notice the loss:
+the retransmissions at the fallback rate succeed, and minstrel keeps
+crediting 48 Mbit/s with about 30% success. The other rates are not
+affected: those with coding rate 1/2 had the field at 0 already, and
+the 3/4 ones (9, 18, 36 and 54 Mbit/s) work the same without it.
+
+With HT rates (not supported by b43 yet), sweeping the field gives the
+same throughput with codes 0, 2, 4 and 6 whatever the MCS, and nothing
+gets through with odd codes. Leave the field at 0 on HT-PHY.
+
+Assisted-by: pi:claude-opus-5-5
+---
+ drivers/net/wireless/broadcom/b43/xmit.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/broadcom/b43/xmit.c
+index f0b082596637..ec3a7a283e4e 100644
+--- a/drivers/net/wireless/broadcom/b43/xmit.c
++++ b/drivers/net/wireless/broadcom/b43/xmit.c
+@@ -183,7 +183,12 @@ static u16 b43_generate_tx_phy_ctl1(struct b43_wldev *dev, u8 bitrate)
+ 		control = bw;
+ 		e = b43_tx_legacy_rate_phy_ctl_ent(bitrate);
+ 		if (e) {
+-			control |= e->coding_rate;
++			/* The HT-PHY takes the coding rate from the PLCP
++			 * header; code 2/3 here makes it send frames nobody
++			 * can decode.
++			 */
++			if (phy->type != B43_PHYTYPE_HT)
++				control |= e->coding_rate;
+ 			control |= e->modulation;
+ 		}
+ 		control |= B43_TXH_PHY1_MODE_SISO;

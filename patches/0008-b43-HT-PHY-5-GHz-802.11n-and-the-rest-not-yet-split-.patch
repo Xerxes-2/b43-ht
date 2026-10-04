@@ -2795,7 +2795,7 @@ index 7ed057118ae3..f71b4b4c2277 100644
  
  #endif /* B43_TABLES_PHY_HT_H_ */
 diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/broadcom/b43/xmit.c
-index 4de6e5042c55..93b25e87b10c 100644
+index ec3a7a283e4e..f048f81b6664 100644
 --- a/drivers/net/wireless/broadcom/b43/xmit.c
 +++ b/drivers/net/wireless/broadcom/b43/xmit.c
 @@ -15,6 +15,7 @@

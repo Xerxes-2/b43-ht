@@ -1,6 +1,6 @@
 # Base: f49defea7668d8c68ec19fa085ef3da6075561c7 (Merge git://git.kernel.org/pub/scm/linux/kernel/git/netdev/net)
 0001-wifi-b43-HT-PHY-fix-the-TX-power-estimate-table-uplo.patch
-0002-wifi-b43-HT-PHY-don-t-flag-coding-rate-2-3-in-PHY-co.patch
+0002-wifi-b43-HT-PHY-don-t-set-the-coding-rate-in-PHY-con.patch
 0003-wifi-b43-return-EOPNOTSUPP-for-ciphers-the-hardware-.patch
 0004-wifi-b43-encrypt-protected-management-frames-in-soft.patch
 0005-wifi-b43-HT-PHY-read-the-low-half-of-32-bit-table-en.patch
