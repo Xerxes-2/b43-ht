@@ -6,9 +6,12 @@ Subject: [PATCH 5/8] wifi: b43: HT-PHY: don't flag coding rate 2/3 in PHY
 
 With B43_TXH_PHY1_CRATE_2_3 set, the HT-PHY transmits frames that no
 receiver decodes, and reports no error. Among legacy rates this bit is
-only used for 48 Mbit/s, so on BCM4331 every 48 Mbit/s frame was lost:
-with the rate fixed to 48 Mbit/s nothing gets through, and rate control
-keeps paying for retries at it.
+only used for 48 Mbit/s. On a BCM4331 at 2.4 GHz, a monitor next to it
+decoded none of the ~2500 frames minstrel tried at 48 Mbit/s in 40
+seconds, while it did decode 54 Mbit/s ones; with the bit cleared it
+decoded 124. Rate control never learns to avoid the rate: the
+retransmissions at the fallback rate succeed, and minstrel keeps
+crediting 48 Mbit/s with about 30% success.
 
 Sweeping the coding rate field shows the HT-PHY takes the rate from the
 PLCP header: any even value transmits correct frames, any odd value

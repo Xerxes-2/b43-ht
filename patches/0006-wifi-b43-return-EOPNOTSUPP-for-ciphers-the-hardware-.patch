@@ -7,9 +7,12 @@ Subject: [PATCH 6/8] wifi: b43: return -EOPNOTSUPP for ciphers the hardware
 Since b43 advertises MFP, mac80211 hands it the BIP key of every
 connection with management frame protection, and possibly GCMP keys.
 b43_op_set_key() treats any cipher other than WEP, TKIP and CCMP as a
-driver bug: it warns (with CONFIG_B43_DEBUG) and returns -EINVAL, which
-mac80211 reports as a failure to set the key before falling back to
-software crypto.
+driver bug: it warns (with CONFIG_B43_DEBUG) and returns -EINVAL, and
+mac80211 logs
+
+  failed to set key (4, ff:ff:ff:ff:ff:ff) to hardware (-22)
+
+on every connection before falling back to software crypto.
 
 Return -EOPNOTSUPP, which tells mac80211 to do the cipher in software
 without complaint.

@@ -5,11 +5,18 @@ Subject: [PATCH 7/8] wifi: b43: encrypt protected management frames in
  software
 
 With management frame protection, unicast robust management frames
-(action frames such as SA Query and Block Ack setup, deauthentication,
+(action frames such as SA Query and Radio Measurement, deauthentication,
 disassociation) are CCMP-protected. When the key is in hardware, b43's
-crypto engine encrypts them like data frames, and the peer can't
-decrypt the result: it drops them. Presumably the engine predates
-802.11w and doesn't set the Management flag in the CCM nonce.
+crypto engine encrypts them as if they were QoS data frames: decrypting
+frames captured from a BCM4331 shows a CCM nonce without the Management
+flag, and an AAD with the subtype bits masked and a zero QoS Control
+field appended (the subtypes of Action and Deauthentication frames have
+the bit that marks a QoS data frame). The peer can't decrypt them.
+
+Against an AP with PMF, the AP got no usable response to its SA Query
+and Radio Measurement requests, and after a disconnect and reconnect it
+started an SA Query procedure, apparently having missed our protected
+Deauthentication.
 
 Set IEEE80211_KEY_FLAG_SW_MGMT_TX on CCMP keys so that mac80211
 encrypts management frames itself; data frames still use the hardware.

@@ -7,8 +7,14 @@ The table of estimated output power per TSSI value was built as an
 array of u32 but uploaded with a 16-bit bulk write, which steps through
 the buffer two bytes at a time. Each core's 64-entry table thus got the
 low and high halves of the first 32 values: entry 2k held the estimate
-for TSSI k and every odd entry 0 or 0xffff. Closed-loop TX power
-control works from these estimates.
+for TSSI k and every odd entry 0 (read back from the hardware). Closed-
+loop TX power control, which is enabled by default, works from these
+estimates.
+
+On a BCM4331 at 2.4 GHz, close to the AP, fixing the table lowers the
+signal seen by a monitor by 4-5 dB, and the higher OFDM rates start
+working: minstrel's success rate at 36 Mbit/s goes from about 40% to
+84%, at 54 Mbit/s from about 31% to 60%.
 
 Build the table as u16.
 
