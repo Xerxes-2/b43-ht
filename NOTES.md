@@ -667,9 +667,20 @@ Close range (-36 dBm), same alternation:
 
 Underflows happen at close range too, and the adaptive limit stays at 11–33 KB there. Chose `ufl-adapt` (patch 0010): the
 right length depends on the host's DMA speed, so a fixed value tuned on this Mac mini may not suit other BCM4331 machines.
-Open question: round 15 measured UDP 220 / TCP 161–166 with zero underflows at the same spot; the build from before this
-round (1b5ea18) now also gives ~170 / ~70 without the limit, so something outside the driver changed (AP firmware or
-settings?). Even with the limit TX stays below those numbers.
+Why round 15 saw no underflows is still open. Not the channel: the AP was untouched, and a 6 s monitor capture on ch44
+shows all transmitters together using 3% of the airtime. Host-side factors, without the limit (two runs each):
+
+| | UDP TX | TCP TX | underflows / 10 s (TCP) |
+|---|---|---|---|
+| default | 152 / 167 | 81 / 90 | 403 / 403 |
+| PCIe ASPM off (Wi-Fi link) | 146 / 175 | 68 / 76 | 478 / 399 |
+| CPU C3/C6/C7 off | 187 / 189 | 113 / 140 | 172 / 141 |
+| both off | 182 / 187 | 133 / 141 | 164 / 124 |
+
+ASPM doesn't matter; deep C-states slow the DMA enough to matter (wakeup latency 80–109 us). With the adaptive limit the
+C-states make no difference (UDP 192–201, TCP 137–146, ~10 underflows / 10 s either way), so no host change is needed.
+The remaining ~10% below round 15 may just be placement (-42 dBm now, -30 then).
+(Writing 0 to `link/l1_aspm` can't be undone through sysfs; it took a reboot.)
 
 PHY TX errors are now logged as a count every 15 s instead of one rate-limited message each (patch 0009).
 
