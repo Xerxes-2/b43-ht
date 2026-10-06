@@ -7,16 +7,32 @@ supports only 2.4 GHz legacy rates on it (`5 GHz band is unsupported on this
 PHY`), so the usual answer has been the proprietary `wl` (broadcom-sta). `wl`
 is unmaintained and has known remote heap overflows (CVE-2019-9501/9502).
 
-With this patch, at close range against a TP-Link Deco on 5 GHz channel 44
-HT40+ (Mbit/s, iperf3):
+Latest near-router tests against a TP-Link Deco on 5 GHz channel 44 HT40+
+(Linux 6.18.54, Mbit/s received by iperf3; TX/RX relative to the card):
 
 | | UDP TX | TCP TX | UDP RX | TCP RX |
 |---|---|---|---|---|
-| b43-ht | 220 | 161–169 | 251–253 | 188–193 |
-| wl | 204 | 165 | 251 | 205 |
+| b43-ht, MRRS 512 + adaptive fallback | 213–216 | 167–170 | 244–249 | 182–192 |
+| wl, MRRS 512 | 195–200 | 159–165 | 241–246 | 204–205 |
 
-A 3-hour soak test produced no disconnects, controller restarts or PHY errors.
-Reconnects take 1.1 s, and band switches 1.1–2.6 s.
+These are 12-second runs on the same card/AP with physical Wi-Fi-path
+checks; b43 ranges include runs before and after deployment. TX is modestly
+faster than wl in this setup, UDP RX is comparable, and TCP RX remains slower.
+UDP was offered at 300 Mbit/s: the RX figures represent capacity, with loss
+under overload, not loss-free delivery at the offered rate. They do not
+establish superiority across other boards, APs, signal levels or workloads.
+
+With automatic MRRS initialization and adaptive fallback retained, a
+600-second TCP TX run averages 168 Mbit/s with zero observed FIFO underflows
+and zero MAC `txphyerr`. Cold boot sets MRRS 512 without prior wl initialization;
+reconnect and a forced controller restart also pass. One BE underflow occurred
+during the short post-boot TCP RX run, so these results are not a claim of
+universally error-free operation. System suspend/resume remains untested.
+
+A historical 3-hour test of an earlier revision produced no disconnects,
+controller restarts or observed PHY errors; it is not a long soak of the
+current MRRS fix. Historical reconnects took 1.1 s, band switches 1.1–2.6 s.
+See [NOTES.md](NOTES.md) rounds 20–21 for controls and remaining limitations.
 
 ## What it adds
 
