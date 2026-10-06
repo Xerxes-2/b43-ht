@@ -9,3 +9,4 @@
 0008-b43-HT-PHY-5-GHz-802.11n-and-the-rest-not-yet-split-.patch
 0009-wifi-b43-report-PHY-transmission-errors-as-a-count-e.patch
 0010-b43-HT-PHY-shorten-A-MPDUs-per-MCS-after-TX-FIFO-und.patch
+0011-wifi-b43-keep-BCM4331-HT-traffic-on-the-best-effort-.patch

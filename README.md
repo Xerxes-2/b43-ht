@@ -30,6 +30,9 @@ Reconnects take 1.1 s, and band switches 1.1–2.6 s.
     own BAR handling.
   - 40 MHz (5 GHz only, as wl).
   - LDPC receive.
+- **BCM4331 HT queue workaround**: retain four mac80211 access categories,
+  but share the working BE transmit FIFO with coordinated backpressure.
+  Non-BE FIFOs can silently discard EF SSH traffic (upstream `09795bded2e7`).
 - **Per-channel PHY settings** taken from the proprietary driver: CRS
   thresholds, TX filter, and the primary-channel selection bits.
 
@@ -116,6 +119,16 @@ Then load it with `htphy_5ghz=2 htphy_11n=3`.
   - Long-range behaviour is unverified.
   - The 40 MHz centre frequencies other than 5230 MHz are interpolated and
     untested.
+- **HT queue sharing.** With HT enabled, all TIDs use BE hardware contention;
+  classification is preserved, but there is no hardware priority isolation.
+  AP/mesh are rejected in this mode because their CAB FIFO has independent
+  backpressure. `qos4331=1` opts back into the unreliable separate FIFOs for
+  experiments; `htphy_11n=0` retains upstream legacy behaviour.
+  PIO is compile-tested only. The idle EF/SSH blackhole is fixed, but mixed
+  saturated bidirectional traffic can still delay SSH until load subsides.
+  Scanning while driver queues are stopped also needs a flush-path review.
+  VO does not automatically aggregate under mac80211's default BA policy;
+  its lower bulk throughput is not itself evidence of this FIFO bug.
 - **TX power table.** Part of a TX power table is only known for this board's
   `pdet_range`.
 - **Not implemented:**

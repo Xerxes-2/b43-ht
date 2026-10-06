@@ -684,6 +684,43 @@ The remaining ~10% below round 15 may just be placement (-42 dBm now, -30 then).
 
 PHY TX errors are now logged as a count every 15 s instead of one rate-limited message each (patch 0009).
 
+## Round 19: BCM4331 HT queues and the SSH blackhole
+
+HT enabling bypassed upstream commit `09795bded2e7` ("wifi: b43: Disable
+QoS for bcm4331"). Ping and the TCP handshake worked, but the DUT's EF SSH
+banner never reached the client. A temporary server with IPQoS none worked;
+client-only IPQoS changes did not. Disabling HT restored both classifications.
+Software crypto and disabling non-BE driver aggregation did not fix it.
+
+Patch 0011 retains the four advertised ACs required for HT but sends all TIDs
+through the usable BE software queue/FIFO, with stop/wake applied to all ACs.
+It preserves the skb AC for mac80211 accounting and covers DMA and PIO queue
+selection. AP/mesh are rejected in this mode: their separate CAB FIFO cannot
+safely share BE's stop/wake bit. A first QUEUE_CONTROL prototype was discarded
+because it also required new monitor-vif handling. The simpler final version
+leaves mac80211's monitor and offchannel queue model unchanged.
+
+`tools/qos-smoke.sh` now reproduces this regression. With Wi-Fi reply routing
+verified and a wired workstation source, the deployed ten-patch baseline times
+out on SSH (exit 124); the fix passes all three SSH commands and all four
+reverse TCP tests. One final 5-second run gives BE 153.5, BK 168.8, VI 142.6,
+VO 28.1 Mbps. These short runs are functional checks, not stable benchmarks.
+
+EF is VO/UP6 under cfg80211's RFC 8325 mapping, **not VI/UP5**. mac80211
+intentionally excludes VO from automatic BA initiation. Debugfs confirms TX BA
+for TIDs 0/1/4/5, none for 6/7; separate 10-second VI runs reach ~148 Mbps.
+Thus the VO bulk-throughput gap has a specific framework explanation rather
+than establishing another broken FIFO. Actual BE/BK/VI/VO paced bidirectional
+traffic plus scanning also preserves SSH; monitor bring-up succeeds.
+
+Remaining caveats: unpaced mixed bidirectional saturation can delay SSH until
+load ends (wl shows highly uneven bandwidth too, but sampled SSH succeeds).
+Scanning while BE is DRIVER-stopped can lose the PM nullfunc: no driver flush
+callback drains it first. That inherited omission needs separate investigation.
+PIO is compiled with W=1, not hardware-tested. After NM cycles an interface,
+its source-policy table can become empty; re-establish the route before any
+Wi-Fi measurement, rather than accidentally testing an Ethernet fallback.
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl

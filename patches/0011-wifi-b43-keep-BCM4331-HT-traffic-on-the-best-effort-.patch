@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Wed, 7 Oct 2026 02:06:10 +1100
+Subject: [PATCH wireless-next 11/11] wifi: b43: keep BCM4331 HT traffic on the
+ best-effort FIFO
+
+Enabling HT bypasses the quirk introduced by
+commit 09795bded2e7 ("wifi: b43: Disable QoS for bcm4331"). Non-BE
+traffic then disappears without a TX error: ping and the SSH TCP
+handshake work, but an EF server banner
+never arrives. Disabling HT or using the BE FIFO restores SSH.
+
+Keep the four ACs required by mac80211 for HT, but route their packets
+through one BE software queue and FIFO unless qos4331 explicitly opts
+into the other FIFOs. Stop and wake all ACs together so ring completion
+cannot strand a previously stopped AC. Preserve the skb AC for
+mac80211 status accounting; use the internal queue ID consistently in
+both DMA and PIO, including aggregate retries.
+
+Reject AP/mesh in shared-queue mode: their independent CAB FIFO would
+otherwise share BE's stop/wake state. Contention is best effort for all
+TIDs; this workaround does not provide hardware priority isolation.
+
+Tested on BCM4331 with Linux 6.18.54, 5 GHz HT40: EF SSH fails before
+and succeeds after, including after scans. BE/BK/VI/VO traffic passes;
+VI TX reaches about 148 Mbps with BA, while VO remains unaggregated
+by mac80211's automatic BA policy. Monitor bring-up also succeeds.
+PIO is compile-tested, not yet hardware-tested. Saturated mixed
+bidirectional traffic can still delay SSH until the load ends; this
+change fixes the idle non-BE blackhole, not saturation latency.
+
+Fixes: 19f136286203 ("b43: HT-PHY: 5 GHz, 802.11n and the rest (not yet split, not for submission)")
+Assisted-by: OpenAI ChatGPT
+---
+ drivers/net/wireless/broadcom/b43/b43.h  | 20 +++++++++++++++++--
+ drivers/net/wireless/broadcom/b43/dma.c  | 12 ++++++------
+ drivers/net/wireless/broadcom/b43/main.c | 25 +++++++++++++++++++++---
+ drivers/net/wireless/broadcom/b43/pio.c  |  8 ++++----
+ 4 files changed, 50 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/b43.h b/drivers/net/wireless/broadcom/b43/b43.h
+index 99d30d4e5fa2..d7f9bcaf6eed 100644
+--- a/drivers/net/wireless/broadcom/b43/b43.h
++++ b/drivers/net/wireless/broadcom/b43/b43.h
+@@ -980,6 +980,7 @@ struct b43_wl {
+ 	struct work_struct tx_work;
+ 
+ 	/* Queue of packets to be transmitted. */
++	bool shared_tx_queue;
+ 	struct sk_buff_head tx_queue[B43_QOS_QUEUE_NUM];
+ 
+ 	/* Flag that implement the queues stopping. */
+@@ -1104,9 +1105,22 @@ static inline bool b43_using_pio_transfers(struct b43_wldev *dev)
+ 	return dev->__using_pio_transfers;
+ }
+ 
++/* Preserve the skb's AC for mac80211 TX-status accounting while all ACs
++ * share the BCM4331 best-effort FIFO and driver software queue.
++ */
++static inline unsigned int b43_tx_queue_mapping(struct b43_wldev *dev,
++						struct sk_buff *skb)
++{
++	if (dev->wl->shared_tx_queue)
++		return IEEE80211_AC_BE;
++	return skb_get_queue_mapping(skb);
++}
++
+ static inline void b43_wake_queue(struct b43_wldev *dev, int queue_prio)
+ {
+-	if (dev->qos_enabled)
++	if (dev->wl->shared_tx_queue)
++		ieee80211_wake_queues(dev->wl->hw);
++	else if (dev->qos_enabled)
+ 		ieee80211_wake_queue(dev->wl->hw, queue_prio);
+ 	else
+ 		ieee80211_wake_queue(dev->wl->hw, 0);
+@@ -1114,7 +1128,9 @@ static inline void b43_wake_queue(struct b43_wldev *dev, int queue_prio)
+ 
+ static inline void b43_stop_queue(struct b43_wldev *dev, int queue_prio)
+ {
+-	if (dev->qos_enabled)
++	if (dev->wl->shared_tx_queue)
++		ieee80211_stop_queues(dev->wl->hw);
++	else if (dev->qos_enabled)
+ 		ieee80211_stop_queue(dev->wl->hw, queue_prio);
+ 	else
+ 		ieee80211_stop_queue(dev->wl->hw, 0);
+diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broadcom/b43/dma.c
+index fe169ee8fd26..03978bf07e84 100644
+--- a/drivers/net/wireless/broadcom/b43/dma.c
++++ b/drivers/net/wireless/broadcom/b43/dma.c
+@@ -1367,7 +1367,7 @@ int b43_dma_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ 	} else {
+ 		/* Decide by priority where to put this frame. */
+ 		ring = select_ring_by_priority(
+-			dev, skb_get_queue_mapping(skb));
++			dev, b43_tx_queue_mapping(dev, skb));
+ 	}
+ 
+ 	B43_WARN_ON(!ring->tx);
+@@ -1394,7 +1394,7 @@ int b43_dma_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ 	/* Assign the queue number to the ring (if not already done before)
+ 	 * so TX status handling can use it. The queue to ring mapping is
+ 	 * static, so we don't need to store it per frame. */
+-	ring->queue_prio = skb_get_queue_mapping(skb);
++	ring->queue_prio = b43_tx_queue_mapping(dev, skb);
+ 
+ 	err = dma_tx_fragment(ring, skb, NULL, true);
+ 	if (unlikely(err == -ENOKEY)) {
+@@ -1411,7 +1411,7 @@ int b43_dma_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ 	if ((free_slots(ring) < TX_SLOTS_PER_FRAME) ||
+ 	    should_inject_overflow(ring)) {
+ 		/* This TX ring is full. */
+-		unsigned int skb_mapping = skb_get_queue_mapping(skb);
++		unsigned int skb_mapping = b43_tx_queue_mapping(dev, skb);
+ 		b43_stop_queue(dev, skb_mapping);
+ 		dev->wl->tx_queue_stopped[skb_mapping] = true;
+ 		ring->stopped = true;
+@@ -1428,7 +1428,7 @@ int b43_dma_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ int b43_dma_tx_free_frames(struct b43_wldev *dev, struct sk_buff *skb)
+ {
+ 	struct b43_dmaring *ring =
+-		select_ring_by_priority(dev, skb_get_queue_mapping(skb));
++		select_ring_by_priority(dev, b43_tx_queue_mapping(dev, skb));
+ 
+ 	if (ring->stopped)
+ 		return 0;
+@@ -1442,7 +1442,7 @@ int b43_dma_tx_free_frames(struct b43_wldev *dev, struct sk_buff *skb)
+ 
+ bool b43_dma_ampdu_busy(struct b43_wldev *dev, struct sk_buff *skb)
+ {
+-	return select_ring_by_priority(dev, skb_get_queue_mapping(skb))->
++	return select_ring_by_priority(dev, b43_tx_queue_mapping(dev, skb))->
+ 		ampdu_inflight >= B43_AMPDU_INFLIGHT;
+ }
+ 
+@@ -1455,7 +1455,7 @@ int b43_dma_tx_ampdu(struct b43_wldev *dev, struct sk_buff_head *list,
+ {
+ 	struct sk_buff *skb = skb_peek(list);
+ 	unsigned int n = skb_queue_len(list), i;
+-	unsigned int queue = skb_get_queue_mapping(skb);
++	unsigned int queue = b43_tx_queue_mapping(dev, skb);
+ 	struct b43_dmaring *ring = select_ring_by_priority(dev, queue);
+ 	struct b43_ampdu_txinfo ampdu = { .total = total };
+ 	int err = 0;
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 8d0e57a0c5dd..49bdd8bfa72e 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -96,7 +96,7 @@ MODULE_PARM_DESC(qos4331, "EXPERIMENTAL: allow QoS (EDCF) on BCM4331 despite the
+ 
+ static int modparam_htphy_11n;
+ module_param_named(htphy_11n, modparam_htphy_11n, int, 0444);
+-MODULE_PARM_DESC(htphy_11n, "EXPERIMENTAL 802.11n on HT-PHY (BCM4331): 1=HT rates at 20 MHz and RX A-MPDU, 2=also TX A-MPDU, 3=also 40 MHz (5 GHz only); implies qos4331");
++MODULE_PARM_DESC(htphy_11n, "EXPERIMENTAL 802.11n on HT-PHY (BCM4331): 1=HT rates at 20 MHz and RX A-MPDU, 2=also TX A-MPDU, 3=also 40 MHz (5 GHz only); shares the BE FIFO unless qos4331=1");
+ 
+ static int modparam_htphy_5ghz;
+ module_param_named(htphy_5ghz, modparam_htphy_5ghz, int, 0444);
+@@ -2722,6 +2722,18 @@ static void b43_request_firmware(struct work_struct *work)
+ 	     !modparam_htphy_11n))
+ 		wl->hw->queues = 1;
+ 
++	/* BCM4331's non-BE FIFOs silently discard traffic (09795bded2e7).
++	 * HT requires four advertised ACs; share BE internally and apply
++	 * driver backpressure to all ACs without changing mac80211's AC IDs.
++	 * TODO revisit: when BCM4331's other FIFOs work reliably.
++	 *   check: test SSH EF and BK/VI/VO traffic on separate DMA FIFOs.
++	 *   then: remove the shared BE queue workaround.
++	 *   last: 2026-10, Linux 6.18.54: EF SSH stalls on the non-BE FIFO.
++	 */
++	wl->shared_tx_queue = wl->hw->queues > 1 &&
++		dev->dev->chip_id == BCMA_CHIP_ID_BCM4331 &&
++		modparam_htphy_11n && !modparam_qos4331;
++
+ 	err = ieee80211_register_hw(wl->hw);
+ 	if (err)
+ 		goto out;
+@@ -3964,13 +3976,13 @@ static void b43_op_tx(struct ieee80211_hw *hw,
+ 		return;
+ 	}
+ 
+-	skb_queue_mapping = skb_get_queue_mapping(skb);
++	skb_queue_mapping = b43_tx_queue_mapping(wl->current_dev, skb);
+ 	skb_queue_tail(&wl->tx_queue[skb_queue_mapping], skb);
+ 	/* Frames waiting to be aggregated: don't take unbounded amounts.
+ 	 * The next TX status wakes the queue again.
+ 	 */
+ 	if (skb_queue_len(&wl->tx_queue[skb_queue_mapping]) > 128)
+-		ieee80211_stop_queue(hw, skb_queue_mapping);
++		b43_stop_queue(wl->current_dev, skb_queue_mapping);
+ 	if (!wl->tx_queue_stopped[skb_queue_mapping])
+ 		ieee80211_queue_work(wl->hw, &wl->tx_work);
+ 	else
+@@ -5360,6 +5372,13 @@ static int b43_op_add_interface(struct ieee80211_hw *hw,
+ 	b43dbg(wl, "Adding Interface type %d\n", vif->type);
+ 
+ 	dev = wl->current_dev;
++	/* CAB has an independent FIFO and cannot share BE's stop/wake bit.
++	 * Keep the workaround to modes without buffered multicast.
++	 */
++	if (wl->shared_tx_queue &&
++	    (vif->type == NL80211_IFTYPE_AP ||
++	     vif->type == NL80211_IFTYPE_MESH_POINT))
++		goto out_mutex_unlock;
+ 	wl->operating = true;
+ 	wl->vif = vif;
+ 	wl->if_type = vif->type;
+diff --git a/drivers/net/wireless/broadcom/b43/pio.c b/drivers/net/wireless/broadcom/b43/pio.c
+index 8358b1d5c298..a483fe8a17f7 100644
+--- a/drivers/net/wireless/broadcom/b43/pio.c
++++ b/drivers/net/wireless/broadcom/b43/pio.c
+@@ -504,7 +504,7 @@ int b43_pio_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ 		hdr->frame_control |= cpu_to_le16(IEEE80211_FCTL_MOREDATA);
+ 	} else {
+ 		/* Decide by priority where to put this frame. */
+-		q = select_queue_by_priority(dev, skb_get_queue_mapping(skb));
++		q = select_queue_by_priority(dev, b43_tx_queue_mapping(dev, skb));
+ 	}
+ 
+ 	hdrlen = b43_txhdr_size(dev);
+@@ -525,7 +525,7 @@ int b43_pio_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ 	if (total_len > (q->buffer_size - q->buffer_used)) {
+ 		/* Not enough memory on the queue. */
+ 		err = -EBUSY;
+-		b43_stop_queue(dev, skb_get_queue_mapping(skb));
++		b43_stop_queue(dev, b43_tx_queue_mapping(dev, skb));
+ 		q->stopped = true;
+ 		goto out;
+ 	}
+@@ -533,7 +533,7 @@ int b43_pio_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ 	/* Assign the queue number to the ring (if not already done before)
+ 	 * so TX status handling can use it. The mac80211-queue to b43-queue
+ 	 * mapping is static, so we don't need to store it per frame. */
+-	q->queue_prio = skb_get_queue_mapping(skb);
++	q->queue_prio = b43_tx_queue_mapping(dev, skb);
+ 
+ 	err = pio_tx_frame(q, skb);
+ 	if (unlikely(err == -ENOKEY)) {
+@@ -552,7 +552,7 @@ int b43_pio_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ 	if (((q->buffer_size - q->buffer_used) < roundup(2 + 2 + 6, 4)) ||
+ 	    (q->free_packet_slots == 0)) {
+ 		/* The queue is full. */
+-		b43_stop_queue(dev, skb_get_queue_mapping(skb));
++		b43_stop_queue(dev, b43_tx_queue_mapping(dev, skb));
+ 		q->stopped = true;
+ 	}
+ 
