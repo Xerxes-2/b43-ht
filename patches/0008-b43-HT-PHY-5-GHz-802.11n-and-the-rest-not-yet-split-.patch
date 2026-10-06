@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 13:12:31 +1100
-Subject: [PATCH wireless-next 08/11] b43: HT-PHY: 5 GHz, 802.11n and the rest
+Subject: [PATCH wireless-next 08/12] b43: HT-PHY: 5 GHz, 802.11n and the rest
  (not yet split, not for submission)
 
 Everything else from b43-ht: 5 GHz support (channel and gain tables,

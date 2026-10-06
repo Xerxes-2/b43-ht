@@ -63,7 +63,13 @@ drive the tests from; "DUT" is the Mac mini running b43 (or wl).
    SOURCE=<workstation-wired-IPv4> DURATION=5 bash tools/qos-smoke.sh
    ```
 
-   `SOURCE` is optional; `PORT` defaults to 5201. This needs `python3` to
+   `SOURCE` is optional; `PORT` defaults to 5201. Binding an IP alone does
+   **not** force the workstation's physical egress device: ensure wired
+   routing or use an explicitly device-bound iperf client for performance
+   comparisons. On a same-subnet dual-NIC DUT, also verify that its Wi-Fi
+   address resolves to its Wi-Fi MAC, not Ethernet (ARP flux). Validate
+   physical DUT interface byte deltas before accepting throughput numbers.
+   This needs `python3` to
    assert nonzero received payload from iperf's JSON. Keep the server's
    normal SSH IPQoS policy: a client-only override does not repair server
    EF traffic. EF maps to VO under RFC 8325, so VI uses CS4 in this test.

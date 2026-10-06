@@ -10,3 +10,4 @@
 0009-wifi-b43-report-PHY-transmission-errors-as-a-count-e.patch
 0010-b43-HT-PHY-shorten-A-MPDUs-per-MCS-after-TX-FIFO-und.patch
 0011-wifi-b43-keep-BCM4331-HT-traffic-on-the-best-effort-.patch
+0012-wifi-b43-raise-BCM4331-HT-PCIe-read-requests-to-512-.patch

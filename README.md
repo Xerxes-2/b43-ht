@@ -33,6 +33,10 @@ Reconnects take 1.1 s, and band switches 1.1–2.6 s.
 - **BCM4331 HT queue workaround**: retain four mac80211 access categories,
   but share the working BE transmit FIFO with coordinated backpressure.
   Non-BE FIFOs can silently discard EF SSH traffic (upstream `09795bded2e7`).
+- **BCM4331 PCIe read-request sizing**: HT TX aggregation requests MRRS
+  512 through the PCI API, avoiding the severe FIFO underflows observed at
+  128 on the tested board. Platform restrictions are respected and adaptive
+  aggregate limiting remains a fallback.
 - **Per-channel PHY settings** taken from the proprietary driver: CRS
   thresholds, TX filter, and the primary-channel selection bits.
 
@@ -129,6 +133,9 @@ Then load it with `htphy_5ghz=2 htphy_11n=3`.
   Scanning while driver queues are stopped also needs a flush-path review.
   VO does not automatically aggregate under mac80211's default BA policy;
   its lower bulk throughput is not itself evidence of this FIFO bug.
+- **PCIe validation.** MRRS 512 is verified on the tested BCM4331; other
+  boards/host bridges and system suspend/resume remain untested. PIO and
+  non-PCI hosts are excluded, and an existing larger MRRS is preserved.
 - **TX power table.** Part of a TX power table is only known for this board's
   `pdet_range`.
 - **Not implemented:**

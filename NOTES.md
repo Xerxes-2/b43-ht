@@ -721,6 +721,80 @@ PIO is compiled with W=1, not hardware-tested. After NM cycles an interface,
 its source-policy table can become empty; re-establish the route before any
 Wi-Fi measurement, rather than accidentally testing an Ethernet fallback.
 
+## Round 20: TX FIFO underflows follow PCIe MRRS, not weak signal
+
+Near the unchanged AP (~-20 dBm, ch44/HT40), compare the same series with
+adaptive, fixed 24 KiB, and uncapped aggregate byte lengths. All b43 cases
+retain round 19's BE queue fix. Use BE traffic, one wired workstation data
+path, and verify physical DUT Ethernet/Wi-Fi byte deltas for every phase.
+Each number below is the range of two 12-second runs, not a long soak.
+
+| Driver/state | MRRS (bytes) | TCP TX | UDP TX | TCP RX | UDP RX | BE underflows / 12 s TCP TX |
+|---|---:|---:|---:|---:|---:|---:|
+| b43 adaptive, b43 boot | 128 | 142–143 | 191–199 | 187–190 | 246 | 6–14 |
+| b43 fixed 24 KiB, b43 boot | 128 | 137–140 | 198–204 | 187–192 | 249–250 | 4 |
+| b43 uncapped, fresh b43 boot | 128 | 72–82 | 173–175 | 187–191 | 246 | 590–622 |
+| wl, one-shot wl boot | 512 | 159–165 | 195–200 | 204–205 | 241–246 | not measured |
+| b43 uncapped after wl boot | 512 | 169–170 | 207–221 | 192–194 | 248–249 | 0 |
+| same uncapped b43, only MRRS changed | 512 | 169–171 | 218 | 190–193 | 246–248 | 0 |
+
+Throughput is Mbps at the receiver. UDP is offered at 300 Mbps, so the
+~14–17% RX loss reflects offered traffic above delivered capacity, not a
+low-rate reliability test. MAC SHM `txphyerr` stays zero; the IRQ PHY-error
+reports are a distinct counter and remain frequent in the MRRS-128 case.
+
+The key differential: after a wl boot then loading b43, the endpoint's
+PCIe MaxReadReq remains 512 bytes. A default b43 boot leaves it at 128.
+The same uncapped module thus reproduces both the historical good result
+and the later underflow regression. CPU idle enable flags and root-port
+configuration match; other endpoint capability fields differ, but changing
+**only** Device Control's MRRS field to 512 on the bad cold-b43 state
+restores throughput and eliminates observed underflows. Reverse it to 128:
+TCP TX falls to 87 Mbps with 642 underflows and 970 retransmits in 12 s.
+This is an A/B/A causal check, not just a boot-profile correlation.
+
+No MRRS change has been made persistent. A driver fix needs the correct
+endpoint initialization location, PCI API and platform/bridge constraints,
+then cold-boot/restart/resume validation. The similarly named 128-byte cap
+in `bcma_core_pci_plat_dev_init()` is for devices on a BCMA PCI-core **host
+bridge**; it must not be assumed to apply to this endpoint. Keep adaptive
+limiting as a safety fallback until broader validation.
+
+Measurement traps found and excluded: binding a source IP does not bind
+an egress interface; use `--bind-dev` or verified routing. Same-subnet dual
+NICs also allow ARP flux: the Wi-Fi IP can resolve to the Ethernet MAC and
+produce impossible >300 Mbps "Wi-Fi" RX results. Temporary correct-interface
+ARP responses plus interface byte counters establish the physical path.
+wl hot-loading did not restore scanning after b43 boot; the wl comparison
+required a one-shot boot, without changing the default b43 entry. All
+temporary profiles, ARP settings, test ports and units were removed, and
+formal adaptive b43/MRRS-128 was restored by reboot at the end.
+
+## Round 21: initialize MRRS through the PCI API
+
+Patch 0012 requests MRRS 512 for BCM4331 HT TX aggregation on a BCMA PCIe
+endpoint, after host setup and before DMA initialization. It leaves legacy
+modes, PIO and non-PCI hosts alone, preserves an already larger request size,
+and honors `pcie_set_readrq()`'s bridge restrictions and performance-mode MPS
+clamp. A failed or clamped request warns but does not prevent association;
+patch 0010's adaptive aggregate limit remains the safety fallback. There is
+no raw config-space override and no change to BCMA hostmode's separate cap.
+
+With the helper and adaptive fallback retained, two 12-second runs reach
+TCP TX 169–170, UDP TX 215–216, TCP RX 191–192 and UDP RX 244–247 Mbps,
+with no observed MAC underflows. Reconnect retains 512. For a real controller
+restart test, force MRRS 128 first, then request the existing debugfs restart:
+mac80211 reinitializes the device, the helper restores 512, and TCP TX reaches
+165 Mbps with no underflows. A 600-second continuous TX run averages 168 Mbps
+with zero underflows and zero MAC `txphyerr`, spanning periodic calibration.
+This is a bounded load check, not a long soak or system suspend/resume test.
+
+Review fixes: inspect `dev->use_pio` (the upcoming mode), not the stale
+`__using_pio_transfers` field assigned later during core initialization; compile
+PCI API calls only with BCMA PCI-host support. W=1 PCI/PIO-enabled object build
+and strict checkpatch pass. System suspend/resume and other platforms remain
+unvalidated; PCI platform restrictions must not be bypassed to force 512.
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl

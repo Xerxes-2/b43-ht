@@ -121,6 +121,7 @@ the table below before the patch is sent.
 | 9 | report PHY transmission errors as a count every 15 s | candidate for batch 2 | Not yet tested alone (no PHY TX errors at 2.4 GHz). Full series, 5 GHz MCS 15 at -59 dBm: "N PHY transmission errors in the last 15 s", N = 420-815 without an A-MPDU limit, matching txfunfl | | |
 | 10 | HT-PHY: shorten A-MPDUs per MCS after TX FIFO underflows | not upstream on its own (needs A-MPDU TX from patch 8) | Full series, 5 GHz HT40 MCS 15: underflows 400-600 -> 8-17 per 10 s, TCP TX 55-79 -> 130-137 | | |
 | 11 | keep BCM4331 HT traffic on the best-effort FIFO | not upstream on its own (fixes experimental HT queue enabling in patch 8) | Idle EF SSH: 0/3 before, 3/3 after, with Wi-Fi source routing verified. BE/BK/VI/VO data and paced mixed traffic pass; VI TX ~148 Mbps with BA. PIO compile-only; AP/mesh intentionally rejected; saturated latency and offchannel flush remain limitations | | |
+| 12 | raise BCM4331 HT PCIe read requests to 512 bytes | not upstream on its own (HT TX aggregation from patch 8) | MRRS 128 -> 512 -> 128 reproduces 590-642 -> 0 -> 642 underflows/12 s. With the patch and adaptive fallback, TCP TX 169-170 Mbps; 600 s TX averages 168 Mbps with zero underflows. Reconnect and forced controller restart pass; system suspend/resume and other bridges untested | | |
 
 b43 is orphaned (MAINTAINERS: `S: Orphan`); patches go to
 linux-wireless@vger.kernel.org and b43-dev@lists.infradead.org and are

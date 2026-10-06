@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Wed, 7 Oct 2026 04:13:38 +1100
+Subject: [PATCH wireless-next 12/12] wifi: b43: raise BCM4331 HT PCIe read
+ requests to 512 bytes
+
+With MRRS 128, large BCM4331 HT A-MPDUs repeatedly underflow the TX
+FIFO even next to the AP. The same hardware running wl uses MRRS 512;
+loading b43 afterwards retains that setting and avoids the regression.
+
+On an uncapped aggregate test, changing only the endpoint Device
+Control MRRS field from 128 to 512 restores TCP TX from 72-87 to
+169-171 Mbps and removes 590-642 underflows per 12 seconds. Changing
+it back reproduces the slow throughput and underflows. RX is mostly
+unchanged. This isolates the PCIe request size rather than RSSI, AP
+configuration or a different driver binary.
+
+For BCM4331 HT TX aggregation on a BCMA PCIe host, request MRRS 512
+after host PCI setup and before DMA initialization. Use the PCI API
+to honor host-bridge restrictions and the performance-mode MPS clamp.
+Do not lower an already larger MRRS, modify other endpoints or alter
+the unrelated BCMA PCI-core hostmode limit. Keep adaptive aggregate
+limiting as fallback if the request fails or remains platform-clamped.
+PIO, non-PCI hosts and legacy HT modes retain their existing behavior.
+Controller restart and resume reinitialization revisit the setting.
+
+Tested on BCM4331/Linux 6.18.54 HT40 with adaptive limiting retained:
+TCP TX 169-170, UDP TX 215-216 Mbps, no observed FIFO underflows;
+reconnect and controller restart retain MRRS 512. A 600-second TCP TX
+run averages 168 Mbps with zero underflows and zero MAC txphyerr.
+System suspend/resume and other platforms are not hardware-tested.
+
+Fixes: 19f136286203 ("b43: HT-PHY: 5 GHz, 802.11n and the rest (not yet split, not for submission)")
+Assisted-by: pi:gpt-6.1-sol
+---
+ drivers/net/wireless/broadcom/b43/main.c | 32 ++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 49bdd8bfa72e..9f75ed75ec3b 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -5192,6 +5192,35 @@ static void b43_wireless_core_exit(struct b43_wldev *dev)
+ 	b43_bus_may_powerdown(dev);
+ }
+ 
++#if defined(CONFIG_B43_BCMA) && defined(CONFIG_BCMA_HOST_PCI)
++static void b43_bcma_set_readrq(struct b43_wldev *dev)
++{
++	struct bcma_bus *bus = dev->dev->bdev->bus;
++	struct pci_dev *pdev;
++	int err;
++
++	if (dev->dev->chip_id != BCMA_CHIP_ID_BCM4331 ||
++	    dev->phy.type != B43_PHYTYPE_HT ||
++	    bus->hosttype != BCMA_HOSTTYPE_PCI || modparam_htphy_11n < 2 ||
++	    dev->use_pio)
++		return;
++	pdev = bus->host_pci;
++	if (!pci_is_pcie(pdev) || pcie_get_readrq(pdev) >= 512)
++		return;
++
++	/* At MRRS 128, large HT A-MPDUs repeatedly underflow the TX FIFO.
++	 * A 512-byte request size eliminates this on the tested BCM4331, matching
++	 * the PCIe state left by wl. Use the PCI API so bridge restrictions
++	 * remain authoritative; adaptive limiting handles a smaller MRRS.
++	 */
++	err = pcie_set_readrq(pdev, 512);
++	if (err)
++		b43warn(dev->wl, "Cannot raise PCIe MRRS to 512 bytes (%d)\n", err);
++	else if (pcie_get_readrq(pdev) < 512)
++		b43warn(dev->wl, "PCIe MRRS remains below 512 bytes\n");
++}
++#endif
++
+ /* Initialize a wireless core */
+ static int b43_wireless_core_init(struct b43_wldev *dev)
+ {
+@@ -5219,6 +5248,9 @@ static int b43_wireless_core_init(struct b43_wldev *dev)
+ 		bcma_host_pci_irq_ctl(dev->dev->bdev->bus,
+ 				      dev->dev->bdev, true);
+ 		bcma_host_pci_up(dev->dev->bdev->bus);
++#ifdef CONFIG_BCMA_HOST_PCI
++		b43_bcma_set_readrq(dev);
++#endif
+ 		break;
+ #endif
+ #ifdef CONFIG_B43_SSB

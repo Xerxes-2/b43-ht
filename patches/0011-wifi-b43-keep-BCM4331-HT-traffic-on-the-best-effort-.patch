@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Wed, 7 Oct 2026 02:06:10 +1100
-Subject: [PATCH wireless-next 11/11] wifi: b43: keep BCM4331 HT traffic on the
+Subject: [PATCH wireless-next 11/12] wifi: b43: keep BCM4331 HT traffic on the
  best-effort FIFO
 
 Enabling HT bypasses the quirk introduced by
@@ -30,7 +30,7 @@ bidirectional traffic can still delay SSH until the load ends; this
 change fixes the idle non-BE blackhole, not saturation latency.
 
 Fixes: 19f136286203 ("b43: HT-PHY: 5 GHz, 802.11n and the rest (not yet split, not for submission)")
-Assisted-by: OpenAI ChatGPT
+Assisted-by: pi:gpt-6.1-sol
 ---
  drivers/net/wireless/broadcom/b43/b43.h  | 20 +++++++++++++++++--
  drivers/net/wireless/broadcom/b43/dma.c  | 12 ++++++------
