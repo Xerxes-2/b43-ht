@@ -892,6 +892,14 @@ restarts the controller after 1 s of frames on the ring without status.
 2-hour soak with that: TCP RX 221-231, TCP TX 178-186, bidir 80/80, SSH
 128/128, scans 23/23; neither recovery path fired.
 
+Deployed as generation 30, the machine froze completely (Ethernet too)
+~9 minutes after boot during TCP RX: the journal just stops, no warning,
+no lockup report, no recovery message; power cycle needed. Both failures
+came with the module loaded at boot; the clean soaks used a module
+swapped in later. Patch 18 is withdrawn (kept on a local branch); the
+series is back to patches 1-17, which passed 3 hours. Next time: arm
+netconsole and a hardlockup panic before testing this again.
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl

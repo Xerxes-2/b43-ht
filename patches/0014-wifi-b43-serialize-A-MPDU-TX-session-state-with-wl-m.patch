@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Wed, 7 Oct 2026 11:24:09 +1100
-Subject: [PATCH wireless-next 14/18] wifi: b43: serialize A-MPDU TX session
+Subject: [PATCH wireless-next 14/17] wifi: b43: serialize A-MPDU TX session
  state with wl->mutex
 
 b43_op_ampdu_action() updates the per-TID A-MPDU state (ampdu_buf,
