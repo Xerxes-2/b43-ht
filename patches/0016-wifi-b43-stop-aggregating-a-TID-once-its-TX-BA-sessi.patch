@@ -25,7 +25,7 @@ restarted session can still see late completions of the previous one;
 those only remove their own start sequence number, which a new session
 has already reset.
 
-Assisted-by: pi:gpt-6.1-sol
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/dma.c  |  9 +++++++--
  drivers/net/wireless/broadcom/b43/main.c | 16 +++++++++++++---

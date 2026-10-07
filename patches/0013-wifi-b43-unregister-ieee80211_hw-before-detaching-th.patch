@@ -33,7 +33,7 @@ fault-injected, and SSB was only build-tested.
 Fixes: 3bf0a32e22fe ("b43: Fix controller restart crash")
 Fixes: f89ff6441df0 ("b43: Fix oops on unload when firmware not found")
 Fixes: 96838d61102a ("b43: Fix memory leaks in b43_bus_dev_ssb_init and b43_bus_dev_bcma_init")
-Assisted-by: pi:gpt-6.1-sol
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/main.c | 59 ++++++++++++++++--------
  1 file changed, 39 insertions(+), 20 deletions(-)

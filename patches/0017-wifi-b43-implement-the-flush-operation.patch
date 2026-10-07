@@ -20,7 +20,7 @@ each) took 17.1 s without and 13.7 s with this; mean TX throughput
 during the scan went from 49-68 to 88-94 Mbit/s, and the one-second
 intervals with no TCP progress went from 5 to 0.
 
-Assisted-by: pi:gpt-6.1-sol
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/main.c | 56 ++++++++++++++++++++++++
  1 file changed, 56 insertions(+)

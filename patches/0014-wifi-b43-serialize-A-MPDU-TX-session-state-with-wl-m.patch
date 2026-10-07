@@ -23,7 +23,7 @@ epoch. A status from an old session can still be processed against the
 state of a new session on the same TID. That is a separate problem and
 is not addressed here.
 
-Assisted-by: pi:gpt-6.1-sol
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/main.c | 11 +++++++++++
  1 file changed, 11 insertions(+)

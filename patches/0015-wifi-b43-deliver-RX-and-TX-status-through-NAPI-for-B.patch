@@ -71,7 +71,7 @@ tuned beyond this setup. This does not address A-MPDU session drain
 or epochs; statuses of a stopped BA session can still be processed
 after a new session on the same TID starts.
 
-Assisted-by: pi:gpt-6.1-sol
+Assisted-by: pi:claude-opus-5-5
 ---
  drivers/net/wireless/broadcom/b43/b43.h  |  37 ++-
  drivers/net/wireless/broadcom/b43/dma.c  |  22 +-
