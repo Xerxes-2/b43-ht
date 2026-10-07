@@ -848,6 +848,15 @@ latency (~100 ms ping under load).
 - Reconnect (`nmcli con down/up`): ~0.9 s, but the first after a while
   ~9 s, spent between deauth and the next auth attempt in userspace; no
   flush timeouts logged.
+- 3-hour soak of the deployed series (patches 1-17, `htphy_napi=1`):
+  alternating 10-minute TCP RX, TCP TX and paced 80+80 Mbit/s
+  bidirectional blocks, a full scan every 5 minutes, SSH over Wi-Fi and
+  ping every minute. TCP RX 227-233, TCP TX 152-166 (scan dips included),
+  bidirectional 80/80. SSH 191/191, scans 34/34, no disconnects, warnings
+  or controller restarts; one 5-ping sample lost 2. BE underflows 2-5 per
+  RX block, 14-20 per bidirectional block, 0-1 per TX block; 124 PHY
+  errors in 3 h. The 100 ms flush timed out 27 times (debug message), so
+  under load the queues do not always drain in time.
 
 ## Next steps
 

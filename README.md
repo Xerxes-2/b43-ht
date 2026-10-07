@@ -48,6 +48,13 @@ seconds without TCP progress. One of six runs still stalled for ~5 s as
 the scan ended. Stopping and restarting the TX BA session up to 1000 times
 under load (patch 16) causes no stall or warning.
 
+A 3-hour soak of the full series with `htphy_napi=1` (alternating
+10-minute TCP RX / TCP TX / paced bidirectional blocks, a scan every
+5 minutes, SSH every minute) ran without disconnects, warnings or
+restarts: TCP RX 227–233, TCP TX 152–166 Mbit/s, SSH 191/191,
+scans 34/34. Underflows and PHY errors still occur at a low rate (see
+NOTES.md round 23).
+
 A historical 3-hour test of an earlier revision produced no disconnects,
 controller restarts or observed PHY errors; it is not a long soak of the
 current MRRS fix. Historical reconnects took 1.1 s, band switches 1.1–2.6 s.
