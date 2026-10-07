@@ -125,6 +125,8 @@ the table below before the patch is sent.
 | 13 | unregister ieee80211_hw before detaching the last core | candidate for batch 2 (generic; Fixes 3bf0a32e22fe, f89ff6441df0, 96838d61102a) | Review only: reset-failure removal, leak and use-after-free paths; no fault injection; SSB build-only | | |
 | 14 | serialize A-MPDU TX session state with wl->mutex | not upstream on its own (A-MPDU TX from patch 8) | Static review of mac80211 callback context; BA drain/epochs not addressed | | |
 | 15 | deliver RX and TX status through NAPI for BCM4331 HT | not upstream on its own (shared BE from patch 11); opt-in `htphy_napi` | TCP RX 199-206 -> 233-237 Mbps (wl 207-212); GRO flush timeout A/B/A 237/199/236; 30 min RX 235 / TX 169; reconnect, restart, s2idle, S3, QoS/SSH, forced backpressure pass. PIO/qos4331 excluded | | |
+| 16 | stop aggregating a TID once its TX BA session is torn down | not upstream on its own (A-MPDU TX from patch 8) | BA stop/start via agg_status debugfs up to 1000x at 10 ms under TCP TX: no stall/warning, throughput recovers at once | | |
+| 17 | implement the flush operation | candidate for batch 2 (generic, but measured only with the full series) | Full scan under TCP TX, 4 runs each: 17.1 -> 13.7 s, 49-68 -> 88-94 Mbps, zero-progress seconds 5 -> 0; 1 of 6 later runs still stalled ~5 s at scan end | | |
 
 b43 is orphaned (MAINTAINERS: `S: Orphan`); patches go to
 linux-wireless@vger.kernel.org and b43-dev@lists.infradead.org and are

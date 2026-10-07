@@ -14,3 +14,5 @@
 0013-wifi-b43-unregister-ieee80211_hw-before-detaching-th.patch
 0014-wifi-b43-serialize-A-MPDU-TX-session-state-with-wl-m.patch
 0015-wifi-b43-deliver-RX-and-TX-status-through-NAPI-for-B.patch
+0016-wifi-b43-stop-aggregating-a-TID-once-its-TX-BA-sessi.patch
+0017-wifi-b43-implement-the-flush-operation.patch

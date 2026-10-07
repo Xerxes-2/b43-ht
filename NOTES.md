@@ -828,6 +828,27 @@ resume pass. Patches 13-14 fix teardown ordering found during review and
 lock A-MPDU session state. Open: BA drain/session epochs, PIO, saturated
 latency (~100 ms ping under load).
 
+## Round 23: leftovers of round 22
+
+- Latency: ping under saturated TCP TX is ~8 ms with b43 vs ~5 ms with wl;
+  under saturated TCP RX ~100 ms (b43) vs ~117 ms (wl), so that queue is in
+  the AP downlink.
+- BA teardown: frames queued or put back for retry keep
+  `IEEE80211_TX_CTL_AMPDU` after the session stops; they went out as
+  1-MPDU A-MPDUs and could trigger BARs for a TID with no agreement. Patch 16
+  treats `ampdu_buf[tid] == 0` as "no session". Loop: `tx stop 0` /
+  `tx start 0` into mac80211's `agg_status` debugfs file, up to 1000x at
+  10 ms during TCP TX. No stall before or after; mostly a semantic fix.
+- Scan under load: without `.flush` mac80211's pre-offchannel flush is a
+  no-op, and the PM nullfunc queues behind up to 256 frames. Patch 17 waits
+  (max 100 ms) for the driver queue and DMA rings. A/B, 4 scans each:
+  17.1 -> 13.7 s, scan-window throughput 49-68 -> 88-94 Mbit/s, stalled
+  seconds 5 -> 0. Under RX load: ~135 Mbit/s, no stalls. One later TX run
+  still stalled ~5 s at scan end (open).
+- Reconnect (`nmcli con down/up`): ~0.9 s, but the first after a while
+  ~9 s, spent between deauth and the next auth attempt in userspace; no
+  flush timeouts logged.
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl

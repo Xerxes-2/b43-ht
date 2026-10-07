@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Wed, 7 Oct 2026 12:18:34 +1100
+Subject: [PATCH wireless-next 16/17] wifi: b43: stop aggregating a TID once
+ its TX BA session is torn down
+
+Frames that were queued in the driver, or put back for retransmission,
+while a TX BA session was operational keep IEEE80211_TX_CTL_AMPDU after
+mac80211 has stopped the session. b43 then sent them as single-MPDU
+A-MPDUs with a window of one, retried unacknowledged MPDUs of the old
+session up to four more times and could send BlockAckReqs for a TID
+without an agreement.
+
+Treat the per-TID buffer size, which is cleared on every TX_STOP_*
+action, as the session state: frames of a stopped session lose the flag
+and go out as ordinary MPDUs, an aggregate never takes in such a frame,
+and the status of an aggregate that completes after the stop neither
+requeues the failed MPDUs nor sends a BAR.
+
+Tested on BCM4331 (5 GHz HT40) by stopping and restarting the TX BA
+session on TID 0 through mac80211's agg_status debugfs file during
+saturated TCP TX, up to 1000 times at 10 ms intervals: no stall or
+warning, and TX throughput returns to its usual level afterwards. A
+restarted session can still see late completions of the previous one;
+those only remove their own start sequence number, which a new session
+has already reset.
+
+Assisted-by: pi:gpt-6.1-sol
+---
+ drivers/net/wireless/broadcom/b43/dma.c  |  9 +++++++--
+ drivers/net/wireless/broadcom/b43/main.c | 16 +++++++++++++---
+ 2 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broadcom/b43/dma.c
+index 641cf3c70acd..6e10d1bc68c4 100644
+--- a/drivers/net/wireless/broadcom/b43/dma.c
++++ b/drivers/net/wireless/broadcom/b43/dma.c
+@@ -1699,11 +1699,16 @@ static void dma_handle_ampdu_txstatus(struct b43_wldev *dev,
+ 			acked = idx < 64 &&
+ 				(status->ba_bitmap[idx / 8] & BIT(idx % 8));
+ 		}
+-		if (!acked && info->control.rates[3].count < B43_AMPDU_RETRIES) {
++		/* No retries or BAR once the session is gone: mac80211 has
++		 * already moved the TID back to normal, non-aggregated TX.
++		 */
++		if (!acked && dev->wl->ampdu_buf[ieee80211_get_tid(hdr)] &&
++		    info->control.rates[3].count < B43_AMPDU_RETRIES) {
+ 			info->control.rates[3].count++;
+ 			__skb_queue_tail(&retry, skb);
+ 		} else {
+-			if (!acked && ieee80211_is_data_qos(hdr->frame_control)) {
++			if (!acked && ieee80211_is_data_qos(hdr->frame_control) &&
++			    dev->wl->ampdu_buf[ieee80211_get_tid(hdr)]) {
+ 				gaveup = le16_to_cpu(hdr->seq_ctrl) >> 4;
+ 				tid = ieee80211_get_tid(hdr);
+ 				ether_addr_copy(ra, hdr->addr1);
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index ecec5b0a7f91..63d6d320e665 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -3965,10 +3965,19 @@ static int b43_rng_init(struct b43_wl *wl)
+ static bool b43_ampdu_candidate(struct b43_wldev *dev, struct sk_buff *skb)
+ {
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+ 
+-	return (info->flags & IEEE80211_TX_CTL_AMPDU) &&
+-	       (info->control.rates[0].flags & IEEE80211_TX_RC_MCS) &&
+-	       ieee80211_is_data_qos(((struct ieee80211_hdr *)skb->data)->frame_control) &&
++	if (!(info->flags & IEEE80211_TX_CTL_AMPDU) ||
++	    !ieee80211_is_data_qos(hdr->frame_control))
++		return false;
++	/* Frames queued (or put back for retry) while the session was up keep
++	 * the flag after it is torn down: send those as ordinary MPDUs.
++	 */
++	if (!dev->wl->ampdu_buf[ieee80211_get_tid(hdr)]) {
++		info->flags &= ~IEEE80211_TX_CTL_AMPDU;
++		return false;
++	}
++	return (info->control.rates[0].flags & IEEE80211_TX_RC_MCS) &&
+ 	       !b43_using_pio_transfers(dev);
+ }
+ 
+@@ -4058,6 +4067,7 @@ static int b43_tx_ampdu(struct b43_wldev *dev, int queue_num,
+ 			if (!(ni->flags & IEEE80211_TX_CTL_AMPDU) ||
+ 			    !ieee80211_is_data_qos(h->frame_control) ||
+ 			    ieee80211_get_tid(h) != tid ||
++			    !wl->ampdu_buf[tid] ||
+ 			    !ether_addr_equal(h->addr1, hdr->addr1) ||
+ 			    total + add > max_len ||
+ 			    (((le16_to_cpu(h->seq_ctrl) >> 4) - ssn) & 0xFFF) >=

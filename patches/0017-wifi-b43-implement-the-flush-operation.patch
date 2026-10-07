@@ -1,0 +1,101 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Wed, 7 Oct 2026 12:31:17 +1100
+Subject: [PATCH wireless-next 17/17] wifi: b43: implement the flush operation
+
+Before mac80211 leaves the operating channel for a scan or a
+remain-on-channel period it stops its queues, flushes, and sends a
+nullfunc frame telling the AP that the station is going to sleep. b43
+had no flush operation, so up to 128 frames in the driver queue and as
+many on the DMA ring were still pending: the nullfunc went out behind
+them and frames kept being transmitted around the channel change.
+
+Wait for the driver queues and the DMA TX rings to drain, at most
+100 ms, kicking the TX worker that feeds the rings. With @drop, discard
+the frames that have not reached the hardware yet. A stopped device has
+nothing that drains its queues, so return at once.
+
+On BCM4331 (5 GHz HT40), a full scan during saturated TCP TX (4 runs
+each) took 17.1 s without and 13.7 s with this; mean TX throughput
+during the scan went from 49-68 to 88-94 Mbit/s, and the one-second
+intervals with no TCP progress went from 5 to 0.
+
+Assisted-by: pi:gpt-6.1-sol
+---
+ drivers/net/wireless/broadcom/b43/main.c | 56 ++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 63d6d320e665..29f24af64cad 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -5853,6 +5853,61 @@ static void b43_op_sta_notify(struct ieee80211_hw *hw,
+ 	B43_WARN_ON(!vif || wl->vif != vif);
+ }
+ 
++static bool b43_tx_pending(struct b43_wl *wl)
++{
++	struct b43_wldev *dev = wl->current_dev;
++	int i;
++
++	/* Nothing drains the queues of a stopped device */
++	if (!dev || b43_status(dev) < B43_STAT_STARTED)
++		return false;
++	for (i = 0; i < B43_QOS_QUEUE_NUM; i++)
++		if (skb_queue_len(&wl->tx_queue[i]))
++			return true;
++	if (b43_using_pio_transfers(dev))
++		return false;
++	return dev->dma.tx_ring_AC_BK->used_slots ||
++	       dev->dma.tx_ring_AC_BE->used_slots ||
++	       dev->dma.tx_ring_AC_VI->used_slots ||
++	       dev->dma.tx_ring_AC_VO->used_slots ||
++	       dev->dma.tx_ring_mcast->used_slots;
++}
++
++/* mac80211 stops its queues and flushes before it sends the nullfunc that
++ * tells the AP we are leaving the channel (scan, remain-on-channel). With
++ * up to 128 frames in the driver queue and as many on the DMA ring, the
++ * nullfunc went out behind them, if at all before the channel change, and
++ * under load the link stalled for seconds per scan. Wait for both to drain;
++ * with @drop, discard what has not reached the hardware yet.
++ */
++static void b43_op_flush(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++			 u32 queues, bool drop)
++{
++	struct b43_wl *wl = hw_to_b43_wl(hw);
++	unsigned long timeout = jiffies + msecs_to_jiffies(100);
++	bool pending;
++	int i;
++
++	if (drop) {
++		mutex_lock(&wl->mutex);
++		for (i = 0; i < B43_QOS_QUEUE_NUM; i++)
++			ieee80211_purge_tx_queue(hw, &wl->tx_queue[i]);
++		mutex_unlock(&wl->mutex);
++	}
++
++	do {
++		mutex_lock(&wl->mutex);
++		pending = b43_tx_pending(wl);
++		mutex_unlock(&wl->mutex);
++		if (!pending)
++			return;
++		ieee80211_queue_work(hw, &wl->tx_work);
++		usleep_range(500, 1000);
++	} while (time_before(jiffies, timeout));
++
++	b43dbg(wl, "TX flush timed out\n");
++}
++
+ static void b43_op_sw_scan_start_notifier(struct ieee80211_hw *hw,
+ 					  struct ieee80211_vif *vif,
+ 					  const u8 *mac_addr)
+@@ -6007,6 +6062,7 @@ static const struct ieee80211_ops b43_hw_ops = {
+ 	.stop			= b43_op_stop,
+ 	.set_tim		= b43_op_beacon_set_tim,
+ 	.sta_notify		= b43_op_sta_notify,
++	.flush			= b43_op_flush,
+ 	.sw_scan_start		= b43_op_sw_scan_start_notifier,
+ 	.sw_scan_complete	= b43_op_sw_scan_complete_notifier,
+ 	.get_survey		= b43_op_get_survey,

@@ -35,8 +35,18 @@ universally error-free operation.
 With `htphy_napi=1`: 30-minute TCP RX averaged 235 Mbit/s and 30-minute TCP TX
 169 Mbit/s, with zero TX FIFO underflows during the RX soak and two during the TX soak,
 SSH 30/30 each; three reconnects, a controller restart, s2idle and S3
-resume all returned to 230–236 Mbit/s TCP RX. Saturated-link ping latency
-is ~100 ms (queueing), so this is a throughput, not a latency, result.
+resume all returned to 230–236 Mbit/s TCP RX.
+
+Latency under load (ping, 0.2 s interval): during saturated TCP TX the
+card's own queues add ~8 ms (wl ~5 ms). During saturated TCP RX both
+drivers see ~100–120 ms: that queue is in the AP's downlink, not in the
+station driver.
+
+A full scan during saturated TCP TX takes 13.7 s and keeps ~90 Mbit/s
+thanks to the flush operation (patch 17); without it 17 s, ~55 Mbit/s and
+seconds without TCP progress. One of six runs still stalled for ~5 s as
+the scan ended. Stopping and restarting the TX BA session up to 1000 times
+under load (patch 16) causes no stall or warning.
 
 A historical 3-hour test of an earlier revision produced no disconnects,
 controller restarts or observed PHY errors; it is not a long soak of the
@@ -156,7 +166,6 @@ Then load it with `htphy_5ghz=2 htphy_11n=3`.
   experiments; `htphy_11n=0` retains upstream legacy behaviour.
   PIO is compile-tested only. The idle EF/SSH blackhole is fixed, but mixed
   saturated bidirectional traffic can still delay SSH until load subsides.
-  Scanning while driver queues are stopped also needs a flush-path review.
   VO does not automatically aggregate under mac80211's default BA policy;
   its lower bulk throughput is not itself evidence of this FIFO bug.
 - **PCIe validation.** MRRS 512 is verified on the tested BCM4331; other
