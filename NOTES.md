@@ -858,6 +858,28 @@ latency (~100 ms ping under load).
   errors in 3 h. The 100 ms flush timed out 27 times (debug message), so
   under load the queues do not always drain in time.
 
+## Round 24: TCP TX
+
+TCP TX was 168-172 Mbit/s against 221 for saturating UDP TX.
+- Not per-socket: `-P 4` gives the same. mac80211's TXQ backlog stays 0,
+  so the frames wait in the driver.
+- TSQ: `tx_sk_pacing_shift` 7, 6, 5, 4 (runtime debug parameter): 168-173
+  for all, no effect.
+- A-MPDUs in flight per ring (runtime debug parameter): 3 -> 153,
+  2 -> 164-172, 1 -> 176-189 Mbit/s, TCP retransmits 38 / ~20 / 0 per
+  15 s. Station dump: MPDU retries 10-11% with two in flight, 4-5% with
+  one; no MPDU finally failed. Why the aggregate queued behind another
+  fails more often is not understood (no FIFO underflows either way).
+- Allowing the second aggregate only when the software queue holds N
+  frames (N = 16..128) does not separate TCP from UDP: TCP only gains once
+  N is so large that UDP loses as much as with a single one.
+
+Patch 18 sets one in flight. 20 s x2: TCP TX 191-192 (0 retransmits),
+UDP TX 201-203, TCP RX 236-237, UDP RX 247-250, bidir 80/80 with zero
+underflows (were 14-20 per 10 min). Scan under TX load ~100 Mbit/s,
+BA flap green, QoS/SSH pass (BE/BK/VI 192-195). Ping under TCP TX
+~10 ms (was ~8).
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl

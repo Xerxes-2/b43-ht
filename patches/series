@@ -16,3 +16,4 @@
 0015-wifi-b43-deliver-RX-and-TX-status-through-NAPI-for-B.patch
 0016-wifi-b43-stop-aggregating-a-TID-once-its-TX-BA-sessi.patch
 0017-wifi-b43-implement-the-flush-operation.patch
+0018-wifi-b43-keep-one-A-MPDU-in-flight-per-ring.patch

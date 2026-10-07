@@ -12,7 +12,8 @@ Latest near-router tests against a TP-Link Deco on 5 GHz channel 44 HT40+
 
 | | UDP TX | TCP TX | UDP RX | TCP RX |
 |---|---|---|---|---|
-| b43-ht, `htphy_napi=1` | 219–222 | 167–169 | 250–252 | 233–237 |
+| b43-ht, patches 1–18, `htphy_napi=1` | 201–203 | 191–192 | 247–250 | 236–237 |
+| b43-ht, patches 1–17, `htphy_napi=1` | 219–222 | 167–169 | 250–252 | 233–237 |
 | b43-ht, without NAPI | 213–216 | 167–170 | 244–249 | 199–206 (120 s) |
 | wl, MRRS 512 | 195–200 | 159–165 | 241–246 | 207–212 |
 
@@ -20,7 +21,9 @@ These are 12–20-second runs (TCP RX also 120 s) on the same card/AP with
 physical Wi-Fi-path checks. With NAPI/GRO delivery, b43-ht is faster than wl
 in every column in this setup; without it, TCP RX trails wl. A 120-second
 A/B/A of the GRO flush timeout gave 237 / 199 / 236 Mbit/s: per-interrupt
-delivery otherwise flushes GRO after every frame.
+delivery otherwise flushes GRO after every frame. Patch 18 keeps one A-MPDU
+in flight instead of two: TCP TX gains ~22 Mbit/s and loses its
+retransmissions, saturating UDP TX loses ~20 (still above wl).
 UDP was offered at 300 Mbit/s: the RX figures represent capacity, with loss
 under overload, not loss-free delivery at the offered rate. They do not
 establish superiority across other boards, APs, signal levels or workloads.
