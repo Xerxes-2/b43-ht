@@ -880,6 +880,18 @@ underflows (were 14-20 per 10 min). Scan under TX load ~100 Mbit/s,
 BA flap green, QoS/SSH pass (BE/BK/VI 192-195). Ping under TCP TX
 ~10 ms (was ~8).
 
+The first soak after deploying patch 18 stalled all Wi-Fi TX about a
+minute in and never recovered: mac80211's TXQ for TID 0 held 2097 frames,
+the BE DMA ring was idle, every pre-scan flush timed out. With one
+aggregate in flight, one A-MPDU status that is lost (or reported as a
+non-A-MPDU status) blocks aggregation for good; with two it only halved
+it. A debug build with counters for skipped/out-of-order statuses and
+partial DMA submissions ran 1 h without recurrence, so the trigger is not
+known. Patch 18 now forgets the aggregate once the ring has drained and
+restarts the controller after 1 s of frames on the ring without status.
+2-hour soak with that: TCP RX 221-231, TCP TX 178-186, bidir 80/80, SSH
+128/128, scans 23/23; neither recovery path fired.
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl

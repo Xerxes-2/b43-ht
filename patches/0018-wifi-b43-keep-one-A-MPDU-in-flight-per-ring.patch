@@ -22,16 +22,26 @@ idle while the host turns the status around. TCP is the common case, so
 take the trade. The ping latency added under TCP TX goes from ~8 to
 ~10 ms.
 
+With one aggregate in flight, a single A-MPDU status that never arrives
+as such stops aggregation on the ring for good. A soak of this change
+once stalled all TX that way about a minute in: mac80211 held 2097
+frames for TID 0, the DMA ring was idle, and every flush timed out.
+Recover: forget the aggregate once the ring has drained, and restart the
+controller if frames have sat on the ring for a second without status.
+Neither fired during the following two-hour soak, so the trigger is
+not known.
+
 Assisted-by: pi:claude-opus-5-5
 ---
- drivers/net/wireless/broadcom/b43/dma.c | 9 ++++++---
- 1 file changed, 6 insertions(+), 3 deletions(-)
+ drivers/net/wireless/broadcom/b43/dma.c | 30 ++++++++++++++++++++-----
+ drivers/net/wireless/broadcom/b43/dma.h |  2 ++
+ 2 files changed, 27 insertions(+), 5 deletions(-)
 
 diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broadcom/b43/dma.c
-index 6e10d1bc68c4..515d99bf2338 100644
+index 6e10d1bc68c4..a89aa3696c7b 100644
 --- a/drivers/net/wireless/broadcom/b43/dma.c
 +++ b/drivers/net/wireless/broadcom/b43/dma.c
-@@ -1442,10 +1442,13 @@ int b43_dma_tx_free_frames(struct b43_wldev *dev, struct sk_buff *skb)
+@@ -1442,15 +1442,34 @@ int b43_dma_tx_free_frames(struct b43_wldev *dev, struct sk_buff *skb)
  	return free_slots(ring) / TX_SLOTS_PER_FRAME;
  }
  
@@ -48,3 +58,47 @@ index 6e10d1bc68c4..515d99bf2338 100644
  
  bool b43_dma_ampdu_busy(struct b43_wldev *dev, struct sk_buff *skb)
  {
+-	return select_ring_by_priority(dev, b43_tx_queue_mapping(dev, skb))->
+-		ampdu_inflight >= B43_AMPDU_INFLIGHT;
++	struct b43_dmaring *ring;
++
++	ring = select_ring_by_priority(dev, b43_tx_queue_mapping(dev, skb));
++	/* Aggregation on the ring waits for the status of the A-MPDU in
++	 * flight. Should that never come back, recover instead of stalling
++	 * all traffic for good: with the ring drained the status was lost
++	 * or taken as a non-A-MPDU one; with frames still on the ring after
++	 * a second the hardware has stopped reporting, so restart it.
++	 */
++	if (unlikely(ring->ampdu_inflight && !ring->used_slots)) {
++		b43dbg(dev->wl, "A-MPDU status lost on ring %d\n", ring->index);
++		ring->ampdu_inflight = 0;
++	} else if (unlikely(ring->ampdu_inflight &&
++			    time_after(jiffies, ring->ampdu_stamp + HZ))) {
++		ring->ampdu_stamp = jiffies;
++		b43_controller_restart(dev, "A-MPDU status timeout");
++	}
++	return ring->ampdu_inflight >= B43_AMPDU_INFLIGHT;
+ }
+ 
+ /* Queue the MPDUs of one A-MPDU (all to the same TID and peer, at the same
+@@ -1501,6 +1520,7 @@ int b43_dma_tx_ampdu(struct b43_wldev *dev, struct sk_buff_head *list,
+ 	}
+ 
+ 	ring->ampdu_inflight++;
++	ring->ampdu_stamp = jiffies;
+ 	if (free_slots(ring) < TX_SLOTS_PER_FRAME) {
+ 		b43_stop_queue(dev, queue);
+ 		dev->wl->tx_queue_stopped[queue] = true;
+diff --git a/drivers/net/wireless/broadcom/b43/dma.h b/drivers/net/wireless/broadcom/b43/dma.h
+index 618c76e0ac6e..c7b2d27dd0d4 100644
+--- a/drivers/net/wireless/broadcom/b43/dma.h
++++ b/drivers/net/wireless/broadcom/b43/dma.h
+@@ -263,6 +263,8 @@ struct b43_dmaring {
+ 	bool stopped;
+ 	/* A-MPDUs queued and not yet reported */
+ 	int ampdu_inflight;
++	/* When the last A-MPDU was handed to the hardware */
++	unsigned long ampdu_stamp;
+ 	/* The QOS priority assigned to this ring. Only used for TX rings.
+ 	 * This is the mac80211 "queue" value. */
+ 	u8 queue_prio;
