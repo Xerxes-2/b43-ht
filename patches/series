@@ -11,3 +11,6 @@
 0010-b43-HT-PHY-shorten-A-MPDUs-per-MCS-after-TX-FIFO-und.patch
 0011-wifi-b43-keep-BCM4331-HT-traffic-on-the-best-effort-.patch
 0012-wifi-b43-raise-BCM4331-HT-PCIe-read-requests-to-512-.patch
+0013-wifi-b43-unregister-ieee80211_hw-before-detaching-th.patch
+0014-wifi-b43-serialize-A-MPDU-TX-session-state-with-wl-m.patch
+0015-wifi-b43-deliver-RX-and-TX-status-through-NAPI-for-B.patch

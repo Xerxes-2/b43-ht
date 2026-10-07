@@ -122,6 +122,9 @@ the table below before the patch is sent.
 | 10 | HT-PHY: shorten A-MPDUs per MCS after TX FIFO underflows | not upstream on its own (needs A-MPDU TX from patch 8) | Full series, 5 GHz HT40 MCS 15: underflows 400-600 -> 8-17 per 10 s, TCP TX 55-79 -> 130-137 | | |
 | 11 | keep BCM4331 HT traffic on the best-effort FIFO | not upstream on its own (fixes experimental HT queue enabling in patch 8) | Idle EF SSH: 0/3 before, 3/3 after, with Wi-Fi source routing verified. BE/BK/VI/VO data and paced mixed traffic pass; VI TX ~148 Mbps with BA. PIO compile-only; AP/mesh intentionally rejected; saturated latency and offchannel flush remain limitations | | |
 | 12 | raise BCM4331 HT PCIe read requests to 512 bytes | not upstream on its own (HT TX aggregation from patch 8) | MRRS 128 -> 512 -> 128 reproduces 590-642 -> 0 -> 642 underflows/12 s. With the patch and adaptive fallback, TCP TX 169-170 Mbps; 600 s TX averages 168 Mbps with zero underflows. Reconnect and forced controller restart pass; system suspend/resume and other bridges untested | | |
+| 13 | unregister ieee80211_hw before detaching the last core | candidate for batch 2 (generic; Fixes 3bf0a32e22fe, f89ff6441df0, 96838d61102a) | Review only: reset-failure removal, leak and use-after-free paths; no fault injection; SSB build-only | | |
+| 14 | serialize A-MPDU TX session state with wl->mutex | not upstream on its own (A-MPDU TX from patch 8) | Static review of mac80211 callback context; BA drain/epochs not addressed | | |
+| 15 | deliver RX and TX status through NAPI for BCM4331 HT | not upstream on its own (shared BE from patch 11); opt-in `htphy_napi` | TCP RX 199-206 -> 233-237 Mbps (wl 207-212); GRO flush timeout A/B/A 237/199/236; 30 min RX 235 / TX 169; reconnect, restart, s2idle, S3, QoS/SSH, forced backpressure pass. PIO/qos4331 excluded | | |
 
 b43 is orphaned (MAINTAINERS: `S: Orphan`); patches go to
 linux-wireless@vger.kernel.org and b43-dev@lists.infradead.org and are

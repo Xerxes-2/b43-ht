@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Wed, 7 Oct 2026 11:24:09 +1100
+Subject: [PATCH wireless-next 14/15] wifi: b43: serialize A-MPDU TX session
+ state with wl->mutex
+
+b43_op_ampdu_action() updates the per-TID A-MPDU state (ampdu_buf,
+ampdu_nssn, ampdu_bar_ssn) and the per-station limits (ampdu_max_len,
+ampdu_density) without holding wl->mutex. b43_tx_work() reads that state
+while it builds aggregates, and the TX status path reads it to send
+BARs. Both run under wl->mutex. A session starting or stopping can
+therefore change the state in the middle of building an aggregate or
+handling a status.
+
+mac80211 calls the ampdu_action callback from sleepable context, so take
+wl->mutex around the TX_OPERATIONAL and TX_STOP_* updates. Call
+ieee80211_stop_tx_ba_cb_irqsafe() after dropping the mutex, as before.
+
+This locking only makes each update atomic against those readers. It
+does not drain the frames or statuses of a stopped session that are
+still queued or in flight, and it does not tag them with a session
+epoch. A status from an old session can still be processed against the
+state of a new session on the same TID. That is a separate problem and
+is not addressed here.
+
+Assisted-by: pi:gpt-6.1-sol
+---
+ drivers/net/wireless/broadcom/b43/main.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 486893cdc326..2b67e9dde62f 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -5649,6 +5649,13 @@ static int b43_op_ampdu_action(struct ieee80211_hw *hw,
+ 	struct b43_wl *wl = hw_to_b43_wl(hw);
+ 	struct ieee80211_sta *sta = params->sta;
+ 
++	/* The per-TID session state below is read by b43_tx_work() and the
++	 * TX status path, both under wl->mutex. This callback may sleep, so
++	 * take the mutex for the updates. It only keeps each update atomic
++	 * against those readers: frames and statuses of a stopped session
++	 * that are still in flight are not drained or told apart from a new
++	 * session on the same TID.
++	 */
+ 	switch (params->action) {
+ 	case IEEE80211_AMPDU_RX_START:
+ 	case IEEE80211_AMPDU_RX_STOP:
+@@ -5658,17 +5665,21 @@ static int b43_op_ampdu_action(struct ieee80211_hw *hw,
+ 			return -EOPNOTSUPP;
+ 		return IEEE80211_AMPDU_TX_START_IMMEDIATE;
+ 	case IEEE80211_AMPDU_TX_OPERATIONAL:
++		mutex_lock(&wl->mutex);
+ 		wl->ampdu_nssn[params->tid] = 0;
+ 		wl->ampdu_bar_ssn[params->tid] = 0;
+ 		wl->ampdu_max_len = (1 << (IEEE80211_HT_MAX_AMPDU_FACTOR +
+ 					   sta->deflink.ht_cap.ampdu_factor)) - 1;
+ 		wl->ampdu_density = sta->deflink.ht_cap.ampdu_density;
+ 		wl->ampdu_buf[params->tid] = min_t(u16, params->buf_size, 64);
++		mutex_unlock(&wl->mutex);
+ 		return 0;
+ 	case IEEE80211_AMPDU_TX_STOP_CONT:
+ 	case IEEE80211_AMPDU_TX_STOP_FLUSH:
+ 	case IEEE80211_AMPDU_TX_STOP_FLUSH_CONT:
++		mutex_lock(&wl->mutex);
+ 		wl->ampdu_buf[params->tid] = 0;
++		mutex_unlock(&wl->mutex);
+ 		ieee80211_stop_tx_ba_cb_irqsafe(vif, sta->addr, params->tid);
+ 		return 0;
+ 	default:

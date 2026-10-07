@@ -795,6 +795,39 @@ PCI API calls only with BCMA PCI-host support. W=1 PCI/PIO-enabled object build
 and strict checkpatch pass. System suspend/resume and other platforms remain
 unvalidated; PCI platform restrictions must not be bypassed to force 512.
 
+## Round 22: TCP RX via NAPI and GRO
+
+Goal: TCP RX was the only column where b43 trailed wl (steady 199-206 vs
+207-212 Mbit/s over 120 s; the same physical-path checks as rounds 20-21).
+
+Negative or unaccepted results, one variable at a time:
+- IRQ affinity to a quiet CPU, RPS to another CPU, performance governor: no
+  change (172-177 Mbit/s in 10 s runs). The IRQ thread CPU was ~48% busy.
+- TX status before RX in the IRQ thread: no difference after a fresh-module
+  control. Paired `_irqsafe` RX/TX-status (tasklet, no GRO): no gain.
+- Tiny-MPDU spacing 8 us: ~200 Mbit/s but 33-72 BE underflows/10 s and PHY
+  errors, rejected. 12 us / one A-MPDU in flight: fresh peaks only, steady
+  120 s results did not hold up.
+- `TX_STATUS_NO_AMPDU_LEN`: minstrel's average A-MPDU length of 1.0 comes
+  from per-MPDU status, but the flag gave no robust throughput change.
+
+Cause: `ieee80211_rx_ni()` delivers each frame with
+`netif_receive_skb_list()`, without GRO, inside the IRQ thread. A first NAPI
+prototype also gained nothing: with one frame per interrupt, every
+`napi_gro_receive()` returned HELD and was flushed at `napi_complete_done()`.
+A 125 us `gro_flush_timeout` on the NAPI device lets segments merge
+(traced: most returns became MERGED); 120 s A/B/A 237 / 199 / 236 Mbit/s.
+
+Patch 15 (opt-in `htphy_napi=1`) queues RX and TX status in one FIFO,
+delivered by a single NAPI poll (no mixed RX/status APIs), bounds RX at 4096
+skbs, and applies lossless TX-status backpressure (2048/512) through the
+existing driver queue stop. Forced 8/2 thresholds recorded ~20k pauses with
+no stall. Results: 30 min TCP RX 235, TCP TX 169, UDP TX 221, UDP RX 250
+(capacity at 300 offered); reconnect x3, controller restart, s2idle and S3
+resume pass. Patches 13-14 fix teardown ordering found during review and
+lock A-MPDU session state. Open: BA drain/session epochs, PIO, saturated
+latency (~100 ms ping under load).
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl

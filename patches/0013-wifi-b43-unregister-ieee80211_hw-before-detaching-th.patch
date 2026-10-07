@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Wed, 7 Oct 2026 11:23:39 +1100
+Subject: [PATCH wireless-next 13/15] wifi: b43: unregister ieee80211_hw before
+ detaching the last core
+
+The BCMA and SSB remove paths only unregister the ieee80211_hw when the
+removed core is still wl->current_dev, and return early without any
+teardown when no firmware was loaded. Both conditions are wrong for the
+ownership b43 actually has: every b43_wl owns exactly one core (BCMA
+allocates a wl per core, SSB rejects dual-core devices).
+
+- A failed controller restart sets wl->current_dev to NULL but leaves
+  the hw registered. Removing the device afterwards skips
+  ieee80211_unregister_hw() and then frees the still-registered hw.
+- If the firmware request fails, the hw is never registered, and the
+  early return leaks the wldev, the bus wrapper and the hw. On SSB the
+  stale devtypedata also makes a later probe of the same device fail
+  with "Dual-core devices are not supported".
+- b43_bcma_remove() reads wldev->dev after b43_one_core_detach() has
+  freed wldev.
+
+Unregister whenever the hw is registered, in one helper shared by both
+buses, before the core is detached and without wl->mutex held, so the
+mac80211 stop callbacks still find a live core. Clear hw_registered and
+current_dev afterwards. Use b43_wireless_exit() for BCMA as well, and
+make it refuse (with a warning) to free a registered hw rather than
+free it under mac80211.
+
+The restart-failure and firmware-failure paths were reviewed, not
+fault-injected, and SSB was only build-tested.
+
+Fixes: 3bf0a32e22fe ("b43: Fix controller restart crash")
+Fixes: f89ff6441df0 ("b43: Fix oops on unload when firmware not found")
+Fixes: 96838d61102a ("b43: Fix memory leaks in b43_bus_dev_ssb_init and b43_bus_dev_bcma_init")
+Assisted-by: pi:gpt-6.1-sol
+---
+ drivers/net/wireless/broadcom/b43/main.c | 59 ++++++++++++++++--------
+ 1 file changed, 39 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 9f75ed75ec3b..486893cdc326 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -6112,15 +6112,42 @@ static void b43_sprom_fixup(struct ssb_bus *bus)
+ 			bus->sprom.boardflags_lo &= ~B43_BFL_BTCOEXIST;
+ 	}
+ }
++#endif
+ 
+ static void b43_wireless_exit(struct b43_bus_dev *dev, struct b43_wl *wl)
+ {
+-	struct ieee80211_hw *hw = wl->hw;
++	/* The remove paths unregister before detaching the core, while the
++	 * mac80211 stop callbacks can still reach it. Leak rather than free
++	 * a registered hw if that ordering is ever violated.
++	 */
++	if (WARN_ON(wl->hw_registered))
++		return;
+ 
+-	ssb_set_devtypedata(dev->sdev, NULL);
+-	ieee80211_free_hw(hw);
+-}
++#ifdef CONFIG_B43_SSB
++	if (dev->bus_type == B43_BUS_SSB)
++		ssb_set_devtypedata(dev->sdev, NULL);
+ #endif
++	ieee80211_free_hw(wl->hw);
++}
++
++/* Each b43_wl owns exactly one core: BCMA allocates one per core and SSB
++ * rejects dual-core devices. Unregister whenever the hw is registered, not
++ * only when the core is still current: a failed controller restart clears
++ * current_dev but leaves the hw registered. A failed firmware load leaves
++ * it unregistered, and the caller must still detach and free everything.
++ *
++ * Call this before detaching the core, without wl->mutex: unregistering
++ * runs the mac80211 stop callbacks, which take the mutex and use the core.
++ */
++static void b43_unregister_hw(struct b43_wl *wl, struct b43_wldev *wldev)
++{
++	if (wl->hw_registered) {
++		b43_leds_stop(wldev);
++		ieee80211_unregister_hw(wl->hw);
++		wl->hw_registered = false;
++	}
++	wl->current_dev = NULL;
++}
+ 
+ static struct b43_wl *b43_wireless_init(struct b43_bus_dev *dev)
+ {
+@@ -6217,7 +6244,7 @@ static int b43_bcma_probe(struct bcma_device *core)
+ 	return err;
+ 
+ bcma_err_wireless_exit:
+-	ieee80211_free_hw(wl->hw);
++	b43_wireless_exit(dev, wl);
+ bcma_out:
+ 	kfree(dev);
+ 	return err;
+@@ -6226,6 +6253,7 @@ static int b43_bcma_probe(struct bcma_device *core)
+ static void b43_bcma_remove(struct bcma_device *core)
+ {
+ 	struct b43_wldev *wldev = bcma_get_drvdata(core);
++	struct b43_bus_dev *dev = wldev->dev;
+ 	struct b43_wl *wl = wldev->wl;
+ 
+ 	/* We must cancel any work here before unregistering from ieee80211,
+@@ -6234,21 +6262,17 @@ static void b43_bcma_remove(struct bcma_device *core)
+ 	cancel_work_sync(&wl->firmware_load);
+ 
+ 	B43_WARN_ON(!wl);
+-	if (!wldev->fw.ucode.data)
+-		return;			/* NULL if firmware never loaded */
+-	if (wl->current_dev == wldev && wl->hw_registered) {
+-		b43_leds_stop(wldev);
+-		ieee80211_unregister_hw(wl->hw);
+-	}
++	b43_unregister_hw(wl, wldev);
+ 
+-	b43_one_core_detach(wldev->dev);
++	/* Frees wldev, so the bus device pointer was cached above. */
++	b43_one_core_detach(dev);
+ 
+ 	/* Unregister HW RNG driver */
+ 	b43_rng_exit(wl);
+ 
+ 	b43_leds_unregister(wl);
+-	ieee80211_free_hw(wl->hw);
+-	kfree(wldev->dev);
++	b43_wireless_exit(dev, wl);
++	kfree(dev);
+ }
+ 
+ static struct bcma_driver b43_bcma_driver = {
+@@ -6317,12 +6341,7 @@ static void b43_ssb_remove(struct ssb_device *sdev)
+ 	cancel_work_sync(&wl->firmware_load);
+ 
+ 	B43_WARN_ON(!wl);
+-	if (!wldev->fw.ucode.data)
+-		return;			/* NULL if firmware never loaded */
+-	if (wl->current_dev == wldev && wl->hw_registered) {
+-		b43_leds_stop(wldev);
+-		ieee80211_unregister_hw(wl->hw);
+-	}
++	b43_unregister_hw(wl, wldev);
+ 
+ 	b43_one_core_detach(dev);
+ 

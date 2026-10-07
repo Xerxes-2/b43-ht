@@ -12,12 +12,15 @@ Latest near-router tests against a TP-Link Deco on 5 GHz channel 44 HT40+
 
 | | UDP TX | TCP TX | UDP RX | TCP RX |
 |---|---|---|---|---|
-| b43-ht, MRRS 512 + adaptive fallback | 213–216 | 167–170 | 244–249 | 182–192 |
-| wl, MRRS 512 | 195–200 | 159–165 | 241–246 | 204–205 |
+| b43-ht, `htphy_napi=1` | 219–222 | 167–169 | 250–252 | 233–237 |
+| b43-ht, without NAPI | 213–216 | 167–170 | 244–249 | 199–206 (120 s) |
+| wl, MRRS 512 | 195–200 | 159–165 | 241–246 | 207–212 |
 
-These are 12-second runs on the same card/AP with physical Wi-Fi-path
-checks; b43 ranges include runs before and after deployment. TX is modestly
-faster than wl in this setup, UDP RX is comparable, and TCP RX remains slower.
+These are 12–20-second runs (TCP RX also 120 s) on the same card/AP with
+physical Wi-Fi-path checks. With NAPI/GRO delivery, b43-ht is faster than wl
+in every column in this setup; without it, TCP RX trails wl. A 120-second
+A/B/A of the GRO flush timeout gave 237 / 199 / 236 Mbit/s: per-interrupt
+delivery otherwise flushes GRO after every frame.
 UDP was offered at 300 Mbit/s: the RX figures represent capacity, with loss
 under overload, not loss-free delivery at the offered rate. They do not
 establish superiority across other boards, APs, signal levels or workloads.
@@ -27,12 +30,18 @@ With automatic MRRS initialization and adaptive fallback retained, a
 and zero MAC `txphyerr`. Cold boot sets MRRS 512 without prior wl initialization;
 reconnect and a forced controller restart also pass. One BE underflow occurred
 during the short post-boot TCP RX run, so these results are not a claim of
-universally error-free operation. System suspend/resume remains untested.
+universally error-free operation.
+
+With `htphy_napi=1`: 30-minute TCP RX averaged 235 Mbit/s and 30-minute TCP TX
+169 Mbit/s, with zero TX FIFO underflows during the RX soak and two during the TX soak,
+SSH 30/30 each; three reconnects, a controller restart, s2idle and S3
+resume all returned to 230–236 Mbit/s TCP RX. Saturated-link ping latency
+is ~100 ms (queueing), so this is a throughput, not a latency, result.
 
 A historical 3-hour test of an earlier revision produced no disconnects,
 controller restarts or observed PHY errors; it is not a long soak of the
 current MRRS fix. Historical reconnects took 1.1 s, band switches 1.1–2.6 s.
-See [NOTES.md](NOTES.md) rounds 20–21 for controls and remaining limitations.
+See [NOTES.md](NOTES.md) rounds 20–22 for controls and remaining limitations.
 
 ## What it adds
 
@@ -93,6 +102,7 @@ All new behaviour is behind module parameters and off by default:
 | `htphy_5ghz` | 0 = off, 1 = receive only, 2 = full |
 | `htphy_11n` | 0 = off, 1 = HT + RX A-MPDU, 2 = also TX A-MPDU, 3 = also 40 MHz |
 | `htphy_txcal`, `htphy_rxcal` | calibrations, default on |
+| `htphy_napi` | 1 = deliver RX/TX status through NAPI with GRO (BCM4331 HT, PCIe DMA, shared BE queue only); default 0 |
 | `qos4331`, `txant` | experiments |
 
 The microcode is the usual b43 firmware 666.2 (`b43-fwcutter` from

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 21:00:02 +1100
-Subject: [PATCH wireless-next 10/12] b43: HT-PHY: shorten A-MPDUs per MCS
+Subject: [PATCH wireless-next 10/15] b43: HT-PHY: shorten A-MPDUs per MCS
  after TX FIFO underflows
 
 At 40 MHz MCS 14/15 DMA can't feed the PHY fast enough through a long

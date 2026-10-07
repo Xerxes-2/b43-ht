@@ -1,0 +1,697 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Wed, 7 Oct 2026 11:29:02 +1100
+Subject: [PATCH wireless-next 15/15] wifi: b43: deliver RX and TX status
+ through NAPI for BCM4331 HT
+
+b43 passes every received frame to mac80211 from its threaded IRQ
+handler with ieee80211_rx_ni(), outside of NAPI, so received TCP
+segments never go through GRO. On a BCM4331 (Mac mini, 5 GHz HT40,
+MCS 15, -21 dBm, short range) TCP receive stays at 199-206 Mbit/s,
+while the proprietary wl driver reaches 212 Mbit/s on the same link.
+
+Add an opt-in NAPI path, enabled with the new htphy_napi module
+parameter (default off). It is only set up for the configuration it was
+tested in: a BCM4331 on BCMA over PCIe with the HT-PHY, htphy_11n >= 2,
+qos4331=0 (so all traffic uses the shared BE FIFO) and DMA. Other
+devices, PIO and separate per-AC FIFOs keep the existing direct
+delivery.
+
+The IRQ thread still does all hardware access under wl->mutex. Instead
+of calling mac80211 directly, it queues received frames and finished TX
+statuses, in completion order, on one FIFO, and schedules a NAPI
+instance on a dummy netdev. The poll function hands them to
+ieee80211_rx_napi() and ieee80211_tx_status_skb() without taking
+wl->mutex. skb->pkt_type tags the queued skbs, as mac80211 does for its
+own frame queue.
+
+The FIFO needs bounds:
+- Received frames are dropped once 4096 skbs are queued.
+- TX statuses are never dropped, since mac80211 needs them for rate
+  control, status reporting and freeing the frames. Instead, TX
+  submission is paused once 2048 statuses are queued: mac80211's queues
+  are stopped, and b43_dma_tx() and b43_dma_tx_ampdu() return -EBUSY,
+  on which b43_tx_work() requeues the frames. While paused, only frames
+  already on the BE and multicast rings, at most 256, can add statuses.
+  The poll function schedules tx_work when the count drops to 512,
+  which lifts the pause under wl->mutex. Existing ring wakes and the
+  core init/start wakes leave a pause in place.
+- NAPI is enabled after core init has chosen DMA or PIO and before the
+  IRQ is requested. It is disabled after the IRQ is freed, and the
+  queue is purged then.
+
+NAPI alone does not help. The IRQ thread typically queues one or a few
+frames per poll, and when the poll completes, napi_complete_done()
+flushes GRO. A trace showed that nearly every napi_gro_receive() call
+returned GRO_HELD and was flushed at the end of the same poll, without
+merging. Throughput stayed at 199 Mbit/s. With a GRO flush timeout,
+held packets wait for the following polls and most of them merge. The
+timeout is 125 us. The dummy netdev is never registered and has no
+sysfs knob, so set its gro_flush_timeout before netif_napi_add(), which
+copies it into the NAPI instance.
+
+Results on that link (TCP, one client and AP, short range), measured
+with a functionally equivalent version of this series on Linux 6.18.54;
+this exact version was only build-tested:
+- 2 min receive A/B/A: 237.12 Mbit/s with NAPI and the timeout, 199.11
+  without the timeout, 235.74 with it again.
+- 30 min receive: 234.72 Mbit/s, no TX FIFO underflows. SSH 30/30,
+  ping loss 0.17%.
+- 30 min transmit: 168.59 Mbit/s, unchanged.
+- Reconnecting 3 times, a controller restart, s2idle and S3 resume:
+  233-236 Mbit/s afterwards.
+- QoS smoke test with BE, BK, VI and VO marked traffic plus SSH: pass.
+- With the TX thresholds temporarily lowered to 8 and 2 to force
+  backpressure: 20719 pauses and no stall.
+
+Limitations: tested on one device and near range only. The PIO path
+and the other eligibility exclusions are not exercised; they keep the
+old delivery. The 4096-skb RX limit and the 125 us timeout are not
+tuned beyond this setup. This does not address A-MPDU session drain
+or epochs; statuses of a stopped BA session can still be processed
+after a new session on the same TID starts.
+
+Assisted-by: pi:gpt-6.1-sol
+---
+ drivers/net/wireless/broadcom/b43/b43.h  |  37 ++-
+ drivers/net/wireless/broadcom/b43/dma.c  |  22 +-
+ drivers/net/wireless/broadcom/b43/main.c | 327 ++++++++++++++++++++++-
+ drivers/net/wireless/broadcom/b43/main.h |   6 +
+ drivers/net/wireless/broadcom/b43/pio.c  |   2 +-
+ drivers/net/wireless/broadcom/b43/xmit.c |   2 +-
+ 6 files changed, 384 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/b43.h b/drivers/net/wireless/broadcom/b43/b43.h
+index d7f9bcaf6eed..e9ee348ceaf4 100644
+--- a/drivers/net/wireless/broadcom/b43/b43.h
++++ b/drivers/net/wireless/broadcom/b43/b43.h
+@@ -3,12 +3,14 @@
+ #define B43_H_
+ 
+ #include <linux/kernel.h>
++#include <linux/atomic.h>
+ #include <linux/spinlock.h>
+ #include <linux/interrupt.h>
+ #include <linux/hw_random.h>
+ #include <linux/bcma/bcma.h>
+ #include <linux/ssb/ssb.h>
+ #include <linux/completion.h>
++#include <linux/netdevice.h>
+ #include <net/mac80211.h>
+ 
+ #include "debugfs.h"
+@@ -901,7 +903,37 @@ struct b43_wl {
+ 	/* Pointer to the ieee80211 hardware data structure */
+ 	struct ieee80211_hw *hw;
+ 
+-	/* Global driver mutex. Every operation must run with this mutex locked. */
++	/* Optional NAPI delivery of RX frames and TX statuses (htphy_napi).
++	 * The IRQ thread queues finished skbs on napi_queue under wl->mutex;
++	 * the poll function only hands them to mac80211 and never takes
++	 * wl->mutex. napi_dev is a dummy netdev that exists only to host the
++	 * NAPI context and is NULL when the device is not eligible.
++	 */
++	struct net_device *napi_dev;
++	struct napi_struct napi;
++	struct sk_buff_head napi_queue;
++	/* Serializes napi_enable()/napi_disable(). napi_enabled changes only
++	 * while no producer runs: before the IRQ is requested or after it
++	 * is freed.
++	 */
++	struct mutex napi_mutex;
++	bool napi_enabled;
++	/* Statistics, protected by wl->mutex. */
++	u64 napi_rx_drops;
++	u64 napi_tx_pauses;
++	/* TX statuses on napi_queue. Incremented under wl->mutex and
++	 * decremented by the poll function without it.
++	 */
++	atomic_t napi_tx_queued;
++	/* TX submission is paused until the TX statuses on napi_queue drain
++	 * to the low watermark. Written under wl->mutex. This is independent of
++	 * tx_queue_stopped[] and the DMA ring stops.
++	 */
++	bool napi_tx_blocked;
++
++	/* Global driver mutex. Every operation must run with this mutex
++	 * locked, except the NAPI poll function (see napi_queue).
++	 */
+ 	struct mutex mutex;
+ 	/* Hard-IRQ spinlock. This lock protects things used in the hard-IRQ
+ 	 * handler, only. This basically is just the IRQ mask register. */
+@@ -1118,6 +1150,9 @@ static inline unsigned int b43_tx_queue_mapping(struct b43_wldev *dev,
+ 
+ static inline void b43_wake_queue(struct b43_wldev *dev, int queue_prio)
+ {
++	/* Ring completions must not undo a NAPI TX status pause. */
++	if (READ_ONCE(dev->wl->napi_tx_blocked))
++		return;
+ 	if (dev->wl->shared_tx_queue)
+ 		ieee80211_wake_queues(dev->wl->hw);
+ 	else if (dev->qos_enabled)
+diff --git a/drivers/net/wireless/broadcom/b43/dma.c b/drivers/net/wireless/broadcom/b43/dma.c
+index 03978bf07e84..641cf3c70acd 100644
+--- a/drivers/net/wireless/broadcom/b43/dma.c
++++ b/drivers/net/wireless/broadcom/b43/dma.c
+@@ -1357,6 +1357,13 @@ int b43_dma_tx(struct b43_wldev *dev, struct sk_buff *skb)
+ 	int err = 0;
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 
++	/* Paused for NAPI TX status backpressure. On -EBUSY the caller
++	 * keeps the skb and requeues it.
++	 */
++	lockdep_assert_held(&dev->wl->mutex);
++	if (dev->wl->napi_tx_blocked)
++		return -EBUSY;
++
+ 	hdr = (struct ieee80211_hdr *)skb->data;
+ 	if (info->flags & IEEE80211_TX_CTL_SEND_AFTER_DTIM) {
+ 		/* The multicast ring will be sent after the DTIM */
+@@ -1460,6 +1467,12 @@ int b43_dma_tx_ampdu(struct b43_wldev *dev, struct sk_buff_head *list,
+ 	struct b43_ampdu_txinfo ampdu = { .total = total };
+ 	int err = 0;
+ 
++	/* As in b43_dma_tx(). wl->mutex is held across the whole batch, so
++	 * the pause cannot start in the middle of an aggregate.
++	 */
++	lockdep_assert_held(&dev->wl->mutex);
++	if (dev->wl->napi_tx_blocked)
++		return -EBUSY;
+ 	if (ring->stopped || free_slots(ring) < n * TX_SLOTS_PER_FRAME)
+ 		return -ENOSPC;
+ 	ring->queue_prio = queue;
+@@ -1516,7 +1529,7 @@ static void dma_ampdu_report(struct b43_wldev *dev, struct sk_buff *skb,
+ 	/* No IEEE80211_TX_STAT_AMPDU_NO_BACK: mac80211 would send one BAR per
+ 	 * MPDU given up, see dma_ampdu_send_bar()
+ 	 */
+-	ieee80211_tx_status_skb(dev->wl->hw, skb);
++	b43_tx_status_handoff(dev, skb);
+ }
+ 
+ /* Each MPDU gets this many more tries in later A-MPDUs (the ucode sends an
+@@ -1842,10 +1855,11 @@ void b43_dma_handle_txstatus(struct b43_wldev *dev,
+ 				ring->nr_failed_tx_packets++;
+ 			ring->nr_total_packet_tries += status->frame_count;
+ #endif /* DEBUG */
+-			ieee80211_tx_status_skb(dev->wl->hw, meta->skb);
++			b43_tx_status_handoff(dev, meta->skb);
+ 
+-			/* skb will be freed by ieee80211_tx_status_skb().
+-			 * Poison our pointer. */
++			/* skb is now owned by b43_tx_status_handoff().
++			 * Poison our pointer.
++			 */
+ 			meta->skb = B43_DMA_PTR_POISON;
+ 		} else {
+ 			/* No need to call free_descriptor_buffer here, as
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 2b67e9dde62f..ecec5b0a7f91 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -94,6 +94,10 @@ static int modparam_qos4331;
+ module_param_named(qos4331, modparam_qos4331, int, 0444);
+ MODULE_PARM_DESC(qos4331, "EXPERIMENTAL: allow QoS (EDCF) on BCM4331 despite the quirk");
+ 
++static bool modparam_htphy_napi;
++module_param_named(htphy_napi, modparam_htphy_napi, bool, 0444);
++MODULE_PARM_DESC(htphy_napi, "EXPERIMENTAL: deliver RX and TX status through NAPI/GRO on BCM4331 PCIe HT-PHY with DMA; needs htphy_11n>=2 and qos4331=0 (default off)");
++
+ static int modparam_htphy_11n;
+ module_param_named(htphy_11n, modparam_htphy_11n, int, 0444);
+ MODULE_PARM_DESC(htphy_11n, "EXPERIMENTAL 802.11n on HT-PHY (BCM4331): 1=HT rates at 20 MHz and RX A-MPDU, 2=also TX A-MPDU, 3=also 40 MHz (5 GHz only); shares the BE FIFO unless qos4331=1");
+@@ -438,6 +442,236 @@ static void b43_op_bss_info_changed(struct ieee80211_hw *hw,
+ 				    struct ieee80211_bss_conf *conf,
+ 				    u64 changed);
+ 
++/* NAPI delivery of RX frames and TX statuses (htphy_napi=1).
++ *
++ * Without it, the IRQ thread hands every received frame to mac80211
++ * outside of NAPI, so received TCP segments never go through GRO.
++ * Instead, the IRQ thread queues RX frames and TX statuses, in hardware
++ * completion order, on one FIFO, and a NAPI poll function on a dummy
++ * netdev hands them to mac80211. All hardware access stays in the IRQ thread under
++ * wl->mutex. The poll function owns only finished skbs and never takes
++ * wl->mutex.
++ *
++ * As mac80211 does for its own frame queue (see
++ * ieee80211_handle_queued_frames()), skb->pkt_type tags the type of the
++ * queued skb. It is reset to 0 before mac80211 sees the skb.
++ */
++#define B43_NAPI_RX		PACKET_HOST
++#define B43_NAPI_TX		PACKET_OUTGOING
++/* Received frames are dropped once this many skbs are queued in total. */
++#define B43_NAPI_RX_LIMIT	4096
++/* TX statuses are never dropped: mac80211 needs them for rate control,
++ * for TX status reporting and to free the frames. Instead, TX submission
++ * is paused at B43_NAPI_TX_HIGH queued statuses and resumed at
++ * B43_NAPI_TX_LOW. While paused, at most the frames already on the BE and
++ * the multicast DMA rings, 2 * B43_TXRING_SLOTS / TX_SLOTS_PER_FRAME = 256,
++ * can add statuses.
++ */
++#define B43_NAPI_TX_HIGH	2048
++#define B43_NAPI_TX_LOW		512
++/* See b43_wireless_init() */
++#define B43_NAPI_GRO_FLUSH_TIMEOUT_NS	125000
++
++static bool b43_napi_eligible(struct b43_bus_dev *dev)
++{
++#if defined(CONFIG_B43_BCMA) && defined(CONFIG_BCMA_HOST_PCI)
++	return modparam_htphy_napi && modparam_htphy_11n >= 2 &&
++		!modparam_qos4331 &&
++		dev->bus_type == B43_BUS_BCMA &&
++		dev->chip_id == BCMA_CHIP_ID_BCM4331 &&
++		dev->bdev->bus->hosttype == BCMA_HOSTTYPE_PCI &&
++		dev->bdev->bus->host_pci &&
++		pci_is_pcie(dev->bdev->bus->host_pci);
++#else
++	return false;
++#endif
++}
++
++static int b43_napi_poll(struct napi_struct *napi, int budget)
++{
++	struct b43_wl *wl = container_of(napi, struct b43_wl, napi);
++	struct sk_buff *skb;
++	int work = 0;
++
++	/* Deliver in queue order. TX statuses count against the budget
++	 * like RX frames.
++	 */
++	while (work < budget && (skb = skb_dequeue(&wl->napi_queue))) {
++		bool tx = skb->pkt_type == B43_NAPI_TX;
++
++		skb->pkt_type = 0;
++		if (tx) {
++			/* Let b43_tx_work() lift the TX pause. This may
++			 * run before the IRQ thread has set the pause, but
++			 * that holds wl->mutex until it has, and the work
++			 * checks the count again under wl->mutex.
++			 */
++			if (atomic_dec_return(&wl->napi_tx_queued) ==
++			    B43_NAPI_TX_LOW)
++				ieee80211_queue_work(wl->hw, &wl->tx_work);
++			ieee80211_tx_status_skb(wl->hw, skb);
++		} else {
++			ieee80211_rx_napi(wl->hw, NULL, skb, napi);
++		}
++		work++;
++	}
++
++	if (work < budget && napi_complete_done(napi, work)) {
++		/* The IRQ thread schedules NAPI after queueing, but that
++		 * is a no-op while this poll still owns NAPI. Recheck the
++		 * queue after completing to not miss such a frame.
++		 * b43_napi_stop() waits for this with synchronize_net().
++		 */
++		smp_mb();
++		if (!skb_queue_empty_lockless(&wl->napi_queue))
++			napi_schedule(napi);
++	}
++	return work;
++}
++
++static void b43_napi_enqueue(struct b43_wl *wl, struct sk_buff *skb,
++			     unsigned char type)
++{
++	unsigned long flags;
++	bool drop;
++	int tx_count = 0;
++
++	lockdep_assert_held(&wl->mutex);
++	skb->pkt_type = type;
++	spin_lock_irqsave(&wl->napi_queue.lock, flags);
++	drop = type == B43_NAPI_RX &&
++		skb_queue_len(&wl->napi_queue) >= B43_NAPI_RX_LIMIT;
++	if (!drop) {
++		if (type == B43_NAPI_TX)
++			tx_count = atomic_inc_return(&wl->napi_tx_queued);
++		__skb_queue_tail(&wl->napi_queue, skb);
++	}
++	spin_unlock_irqrestore(&wl->napi_queue.lock, flags);
++
++	if (drop) {
++		wl->napi_rx_drops++;
++		dev_kfree_skb_any(skb);
++		return;
++	}
++	if (tx_count >= B43_NAPI_TX_HIGH && !wl->napi_tx_blocked) {
++		/* Every submission path runs under wl->mutex and checks
++		 * napi_tx_blocked, so none can be halfway through.
++		 */
++		WRITE_ONCE(wl->napi_tx_blocked, true);
++		wl->napi_tx_pauses++;
++		ieee80211_stop_queues(wl->hw);
++	}
++	napi_schedule(&wl->napi);
++}
++
++void b43_rx_handoff(struct b43_wldev *dev, struct sk_buff *skb)
++{
++	struct b43_wl *wl = dev->wl;
++
++	lockdep_assert_held(&wl->mutex);
++	if (wl->napi_enabled)
++		b43_napi_enqueue(wl, skb, B43_NAPI_RX);
++	else
++		ieee80211_rx_ni(wl->hw, skb);
++}
++
++void b43_tx_status_handoff(struct b43_wldev *dev, struct sk_buff *skb)
++{
++	struct b43_wl *wl = dev->wl;
++
++	lockdep_assert_held(&wl->mutex);
++	if (wl->napi_enabled)
++		b43_napi_enqueue(wl, skb, B43_NAPI_TX);
++	else
++		ieee80211_tx_status_skb(wl->hw, skb);
++}
++
++/* Called after the core is initialized, so the transfer mode is known,
++ * and before the IRQ is requested.
++ */
++static void b43_napi_start(struct b43_wldev *dev)
++{
++	struct b43_wl *wl = dev->wl;
++
++	/* Lock order is wl->mutex, then napi_mutex. */
++	lockdep_assert_held(&wl->mutex);
++	mutex_lock(&wl->napi_mutex);
++	if (wl->napi_dev && dev->phy.type == B43_PHYTYPE_HT &&
++	    wl->shared_tx_queue && !b43_using_pio_transfers(dev) &&
++	    !wl->napi_enabled) {
++		atomic_set(&wl->napi_tx_queued, 0);
++		WRITE_ONCE(wl->napi_tx_blocked, false);
++		napi_enable(&wl->napi);
++		wl->napi_enabled = true;
++		b43dbg(wl, "NAPI enabled (%llu RX drops, %llu TX pauses so far)\n",
++		       wl->napi_rx_drops, wl->napi_tx_pauses);
++	}
++	mutex_unlock(&wl->napi_mutex);
++}
++
++/* The caller must have stopped all producers: freed the IRQ, or failed
++ * before requesting it. Must not be called with wl->mutex held.
++ */
++static void b43_napi_stop(struct b43_wl *wl)
++{
++	struct sk_buff *skb;
++	bool disabled = false;
++
++	if (!wl->napi_dev)
++		return;
++
++	/* b43_wireless_core_stop() drops wl->mutex, so a stop and a
++	 * controller restart can both get here for one napi_enable().
++	 */
++	mutex_lock(&wl->napi_mutex);
++	if (!wl->napi_enabled)
++		goto out_unlock;
++	napi_disable(&wl->napi);
++	/* napi_disable() returns once the poll function has given up NAPI,
++	 * which may be before its recheck after napi_complete_done().
++	 */
++	synchronize_net();
++	wl->napi_enabled = false;
++	while ((skb = skb_dequeue(&wl->napi_queue))) {
++		bool tx = skb->pkt_type == B43_NAPI_TX;
++
++		skb->pkt_type = 0;
++		if (tx)
++			ieee80211_free_txskb(wl->hw, skb);
++		else
++			dev_kfree_skb_any(skb);
++	}
++	atomic_set(&wl->napi_tx_queued, 0);
++	disabled = true;
++out_unlock:
++	mutex_unlock(&wl->napi_mutex);
++
++	/* Lift a TX pause of this NAPI instance. If b43_napi_start() has
++	 * enabled NAPI again in the meantime, the pause belongs to that one.
++	 * Wake the queues only if no ring or software stop is pending and
++	 * the core is not started; b43_wireless_core_start() wakes them
++	 * when it starts.
++	 */
++	mutex_lock(&wl->mutex);
++	if (!wl->napi_enabled && wl->napi_tx_blocked) {
++		struct b43_wldev *dev = wl->current_dev;
++
++		WRITE_ONCE(wl->napi_tx_blocked, false);
++		if (dev && b43_status(dev) < B43_STAT_STARTED &&
++		    wl->shared_tx_queue && !b43_using_pio_transfers(dev) &&
++		    !wl->tx_queue_stopped[IEEE80211_AC_BE] &&
++		    dev->dma.tx_ring_AC_BE &&
++		    !dev->dma.tx_ring_AC_BE->stopped &&
++		    dev->dma.tx_ring_mcast &&
++		    !dev->dma.tx_ring_mcast->stopped)
++			ieee80211_wake_queues(wl->hw);
++	}
++	if (disabled)
++		b43dbg(wl, "NAPI disabled (%llu RX drops, %llu TX pauses so far)\n",
++		       wl->napi_rx_drops, wl->napi_tx_pauses);
++	mutex_unlock(&wl->mutex);
++}
++
+ static int b43_ratelimit(struct b43_wl *wl)
+ {
+ 	if (!wl || !wl->current_dev)
+@@ -3856,7 +4090,7 @@ static int b43_tx_ampdu(struct b43_wldev *dev, int queue_num,
+ 	if (err) {
+ 		unsigned long flags;
+ 
+-		if (err != -ENOSPC) {
++		if (err != -ENOSPC && err != -EBUSY) {
+ 			while ((skb = __skb_dequeue(&agg)))
+ 				ieee80211_free_txskb(wl->hw, skb);
+ 			return 0;
+@@ -3907,6 +4141,26 @@ static void b43_tx_work(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	/* Lift the NAPI TX status pause once the poll function has drained
++	 * the statuses to the low watermark; it schedules this work then.
++	 * The pause is only ever set for shared-BE DMA. The IRQ thread sets
++	 * it under wl->mutex, so it cannot start in the middle of this loop.
++	 * Leave mac80211's queues stopped if a ring or software stop is still
++	 * pending: its own completion path wakes them.
++	 */
++	if (wl->napi_tx_blocked) {
++		if (atomic_read(&wl->napi_tx_queued) > B43_NAPI_TX_LOW)
++			goto out_unlock;
++		if (WARN_ON_ONCE(!wl->shared_tx_queue ||
++				 b43_using_pio_transfers(dev)))
++			goto out_unlock;
++		WRITE_ONCE(wl->napi_tx_blocked, false);
++		if (!wl->tx_queue_stopped[IEEE80211_AC_BE] &&
++		    !dev->dma.tx_ring_AC_BE->stopped &&
++		    !dev->dma.tx_ring_mcast->stopped)
++			b43_wake_queue(dev, IEEE80211_AC_BE);
++	}
++
+ 	for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
+ 		while (skb_queue_len(&wl->tx_queue[queue_num])) {
+ 			skb = skb_dequeue(&wl->tx_queue[queue_num]);
+@@ -3934,6 +4188,11 @@ static void b43_tx_work(struct work_struct *work)
+ 				err = b43_pio_tx(dev, skb);
+ 			else
+ 				err = b43_dma_tx(dev, skb);
++			if (err == -EBUSY) {
++				/* NAPI TX status pause, see above */
++				skb_queue_head(&wl->tx_queue[queue_num], skb);
++				goto out_unlock;
++			}
+ 			if (err == -ENOSPC) {
+ 				wl->tx_queue_stopped[queue_num] = true;
+ 				b43_stop_queue(dev, queue_num);
+@@ -3952,6 +4211,7 @@ static void b43_tx_work(struct work_struct *work)
+ #if B43_DEBUG
+ 	dev->tx_count++;
+ #endif
++out_unlock:
+ 	mutex_unlock(&wl->mutex);
+ }
+ 
+@@ -4706,11 +4966,13 @@ static struct b43_wldev * b43_wireless_core_stop(struct b43_wldev *dev)
+ 	struct b43_wldev *orig_dev;
+ 	u32 mask;
+ 	int queue_num;
++	bool mac_suspended;
+ 
+ 	if (!dev)
+ 		return NULL;
+ 	wl = dev->wl;
+ redo:
++	mac_suspended = false;
+ 	if (!dev || b43_status(dev) < B43_STAT_STARTED)
+ 		return dev;
+ 
+@@ -4745,6 +5007,21 @@ static struct b43_wldev * b43_wireless_core_stop(struct b43_wldev *dev)
+ 		b43_sdio_free_irq(dev);
+ 	else
+ 		free_irq(dev->dev->irq, dev);
++	/* With NAPI, suspend the MAC before b43_napi_stop() can lift a TX
++	 * pause and wake the mac80211 queues. The IRQ is gone and the
++	 * INITIALIZED status keeps b43_tx_work() from submitting. A change
++	 * of the current core is handled below.
++	 */
++	mutex_lock(&wl->mutex);
++	dev = wl->current_dev;
++	if (wl->napi_enabled && dev == orig_dev &&
++	    b43_status(dev) == B43_STAT_INITIALIZED) {
++		b43_mac_suspend(dev);
++		mac_suspended = true;
++	}
++	mutex_unlock(&wl->mutex);
++	/* Delivers nothing more; also reached from a controller restart. */
++	b43_napi_stop(wl);
+ 	mutex_lock(&wl->mutex);
+ 	dev = wl->current_dev;
+ 	if (!dev)
+@@ -4767,7 +5044,8 @@ static struct b43_wldev * b43_wireless_core_stop(struct b43_wldev *dev)
+ 		}
+ 	}
+ 
+-	b43_mac_suspend(dev);
++	if (!mac_suspended)
++		b43_mac_suspend(dev);
+ 	b43_leds_exit(dev);
+ 	b43dbg(wl, "Wireless interface stopped\n");
+ 
+@@ -4799,8 +5077,9 @@ static int b43_wireless_core_start(struct b43_wldev *dev)
+ 		}
+ 	}
+ 
+-	/* We are ready to run. */
+-	ieee80211_wake_queues(dev->wl->hw);
++	/* We are ready to run, unless TX is paused for NAPI TX statuses. */
++	if (!READ_ONCE(dev->wl->napi_tx_blocked))
++		ieee80211_wake_queues(dev->wl->hw);
+ 	b43_set_status(dev, B43_STAT_STARTED);
+ 
+ 	/* Start data flow (TX/RX). */
+@@ -5367,7 +5646,9 @@ static int b43_wireless_core_init(struct b43_wldev *dev)
+ 	b43_upload_card_macaddress(dev);
+ 	b43_security_init(dev);
+ 
+-	ieee80211_wake_queues(dev->wl->hw);
++	/* Do not override a TX pause for NAPI TX statuses. */
++	if (!READ_ONCE(dev->wl->napi_tx_blocked))
++		ieee80211_wake_queues(dev->wl->hw);
+ 
+ 	b43_set_status(dev, B43_STAT_INITIALIZED);
+ 
+@@ -5483,6 +5764,8 @@ static int b43_op_start(struct ieee80211_hw *hw)
+ 		did_init = 1;
+ 	}
+ 
++	/* After core init has chosen DMA or PIO, before the IRQ is requested */
++	b43_napi_start(dev);
+ 	if (b43_status(dev) < B43_STAT_STARTED) {
+ 		err = b43_wireless_core_start(dev);
+ 		if (err) {
+@@ -5497,6 +5780,9 @@ static int b43_op_start(struct ieee80211_hw *hw)
+ 
+  out_mutex_unlock:
+ 	mutex_unlock(&wl->mutex);
++	/* No IRQ handler is left after a failed init or start. */
++	if (err)
++		b43_napi_stop(wl);
+ 
+ 	/*
+ 	 * Configuration may have been overwritten during initialization.
+@@ -5532,6 +5818,8 @@ static void b43_op_stop(struct ieee80211_hw *hw, bool suspend)
+ out_unlock:
+ 	mutex_unlock(&wl->mutex);
+ out:
++	/* The core may have been stopped already, by a controller restart. */
++	b43_napi_stop(wl);
+ 	cancel_work_sync(&(wl->txpower_adjust_work));
+ }
+ 
+@@ -6138,6 +6426,12 @@ static void b43_wireless_exit(struct b43_bus_dev *dev, struct b43_wl *wl)
+ 	if (dev->bus_type == B43_BUS_SSB)
+ 		ssb_set_devtypedata(dev->sdev, NULL);
+ #endif
++	/* Normally a no-op: b43_op_stop() has stopped NAPI already. */
++	b43_napi_stop(wl);
++	if (wl->napi_dev) {
++		netif_napi_del(&wl->napi);
++		free_netdev(wl->napi_dev);
++	}
+ 	ieee80211_free_hw(wl->hw);
+ }
+ 
+@@ -6201,6 +6495,29 @@ static struct b43_wl *b43_wireless_init(struct b43_bus_dev *dev)
+ 
+ 	/* Initialize struct b43_wl */
+ 	wl->hw = hw;
++	mutex_init(&wl->napi_mutex);
++	skb_queue_head_init(&wl->napi_queue);
++	atomic_set(&wl->napi_tx_queued, 0);
++	if (b43_napi_eligible(dev)) {
++		wl->napi_dev = alloc_netdev_dummy(0);
++		if (!wl->napi_dev) {
++			ieee80211_free_hw(hw);
++			return ERR_PTR(-ENOMEM);
++		}
++		/* The IRQ thread usually queues only one or a few frames
++		 * before NAPI polls. With no flush timeout, completing the
++		 * poll flushes GRO every time, so frames are held and flushed
++		 * one by one and almost never merged. With a timeout, held
++		 * packets wait, at most this long, for the following polls.
++		 * The value was chosen on a BCM4331 at 5 GHz HT40.
++		 *
++		 * The dummy netdev is never registered, so there is no sysfs
++		 * knob. netif_napi_add() copies the netdev default into the
++		 * NAPI instance.
++		 */
++		wl->napi_dev->gro_flush_timeout = B43_NAPI_GRO_FLUSH_TIMEOUT_NS;
++		netif_napi_add(wl->napi_dev, &wl->napi, b43_napi_poll);
++	}
+ 	mutex_init(&wl->mutex);
+ 	spin_lock_init(&wl->hardirq_lock);
+ 	spin_lock_init(&wl->beacon_lock);
+diff --git a/drivers/net/wireless/broadcom/b43/main.h b/drivers/net/wireless/broadcom/b43/main.h
+index df64efce31c4..c2bcffed0bdc 100644
+--- a/drivers/net/wireless/broadcom/b43/main.h
++++ b/drivers/net/wireless/broadcom/b43/main.h
+@@ -78,6 +78,12 @@ void b43_wireless_core_reset(struct b43_wldev *dev, bool gmode);
+ 
+ void b43_controller_restart(struct b43_wldev *dev, const char *reason);
+ 
++/* Hand a received frame or a TX status to mac80211, directly or via NAPI.
++ * Called under wl->mutex. Takes ownership of the skb.
++ */
++void b43_rx_handoff(struct b43_wldev *dev, struct sk_buff *skb);
++void b43_tx_status_handoff(struct b43_wldev *dev, struct sk_buff *skb);
++
+ #define B43_PS_ENABLED	(1 << 0)	/* Force enable hardware power saving */
+ #define B43_PS_DISABLED	(1 << 1)	/* Force disable hardware power saving */
+ #define B43_PS_AWAKE	(1 << 2)	/* Force device awake */
+diff --git a/drivers/net/wireless/broadcom/b43/pio.c b/drivers/net/wireless/broadcom/b43/pio.c
+index a483fe8a17f7..87ab09d06ee4 100644
+--- a/drivers/net/wireless/broadcom/b43/pio.c
++++ b/drivers/net/wireless/broadcom/b43/pio.c
+@@ -582,7 +582,7 @@ void b43_pio_handle_txstatus(struct b43_wldev *dev,
+ 	q->buffer_used -= total_len;
+ 	q->free_packet_slots += 1;
+ 
+-	ieee80211_tx_status_skb(dev->wl->hw, pack->skb);
++	b43_tx_status_handoff(dev, pack->skb);
+ 	pack->skb = NULL;
+ 	list_add(&pack->list, &q->packets_list);
+ 
+diff --git a/drivers/net/wireless/broadcom/b43/xmit.c b/drivers/net/wireless/broadcom/b43/xmit.c
+index f048f81b6664..67b9117b20de 100644
+--- a/drivers/net/wireless/broadcom/b43/xmit.c
++++ b/drivers/net/wireless/broadcom/b43/xmit.c
+@@ -1055,7 +1055,7 @@ void b43_rx(struct b43_wldev *dev, struct sk_buff *skb, const void *_rxhdr)
+ 	}
+ 
+ 	memcpy(IEEE80211_SKB_RXCB(skb), &status, sizeof(status));
+-	ieee80211_rx_ni(dev->wl->hw, skb);
++	b43_rx_handoff(dev, skb);
+ 
+ #if B43_DEBUG
+ 	dev->rx_count++;
