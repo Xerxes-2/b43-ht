@@ -12,7 +12,7 @@ Latest near-router tests against a TP-Link Deco on 5 GHz channel 44 HT40+
 
 | | UDP TX | TCP TX | UDP RX | TCP RX |
 |---|---|---|---|---|
-| b43-ht, patches 1–19, `htphy_napi=1` | 189–195 | 187–190 | 248–250 | 230–232 |
+| b43-ht, patches 1–19, `htphy_napi=1` | 176–195 | 187–190 | 246–250 | 224–232 |
 | b43-ht, patches 1–17, `htphy_napi=1` | 219–222 | 167–169 | 250–252 | 233–237 |
 | b43-ht, without NAPI | 213–216 | 167–170 | 244–249 | 199–206 (120 s) |
 | wl, MRRS 512 | 195–200 | 159–165 | 241–246 | 207–212 |
@@ -24,7 +24,7 @@ A/B/A of the GRO flush timeout gave 237 / 199 / 236 Mbit/s: per-interrupt
 delivery otherwise flushes GRO after every frame. Patch 19 keeps one
 A-MPDU in flight instead of two: TCP TX gains ~20 Mbit/s and its
 retransmissions drop to zero in short runs, at the cost of ~25 Mbit/s of
-saturated UDP TX, which falls just below wl. The patches 1–19 row was taken
+saturated UDP TX (176–195), now below wl. The patches 1–19 row was taken
 with Turbo Boost off (see NOTES.md round 25).
 UDP was offered at 300 Mbit/s: the RX figures represent capacity, with loss
 under overload, not loss-free delivery at the offered rate. They do not

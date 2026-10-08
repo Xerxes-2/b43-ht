@@ -931,7 +931,9 @@ TCP TX per 10-minute block 145-183 Mbit/s (it drifted down for a few hours
 overnight and back), TCP RX 193-226, paced bidirectional 80/80.
 
 Short runs, same hour, Turbo Boost off: TCP TX 187-190 (patches 1-17:
-162-165), TCP RX 230-232, UDP TX 189-195 (213), UDP RX 248-250.
+162-165), TCP RX 230-232, UDP TX 189-195 (213), UDP RX 248-250. After
+deploying (generation 43): TCP TX 188-189, TCP RX 224-231, UDP TX 176-179,
+UDP RX 246-247; QoS/SSH smoke passes.
 
 A debug build crashed on association (a NULL dereference in my own logging,
 reading the aggregate list after DMA had taken the frames); netconsole
