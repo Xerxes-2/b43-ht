@@ -1,0 +1,161 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Fri, 9 Oct 2026 01:43:43 +1100
+Subject: [PATCH wireless-next 18/19] wifi: b43: drop BARs that went stale on
+ the way to the hardware
+
+mac80211 queues a BAR in the TID's TXQ behind the data waiting there.
+Under load on BCM4331 (5 GHz HT40, TCP TX) BARs reached the driver up
+to 0.7 s and 1300 MPDUs after they were sent. Once the recipient's
+window is more than 2048 past a BAR's start sequence number, the BAR
+reads as one far ahead: the recipient moves its window there and drops
+everything we send as old until our sequence numbers catch up. With
+TCP stalled that took 10-17 minutes, during which the station could
+not reach anything, although every frame went out and was acked.
+
+Track the newest sequence number handed to the hardware per TID and
+drop a BAR whose start is 1024 or more behind it, or ahead of it: it
+has no holes left to skip. Report it as acked, or mac80211 sends it
+again on the next ACK.
+
+Assisted-by: pi:claude-opus-5-5
+---
+ drivers/net/wireless/broadcom/b43/b43.h  |  4 ++
+ drivers/net/wireless/broadcom/b43/main.c | 65 +++++++++++++++++++++++-
+ 2 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/b43.h b/drivers/net/wireless/broadcom/b43/b43.h
+index e9ee348ceaf4..671bf3178f80 100644
+--- a/drivers/net/wireless/broadcom/b43/b43.h
++++ b/drivers/net/wireless/broadcom/b43/b43.h
+@@ -987,6 +987,10 @@ struct b43_wl {
+ 	u8 ampdu_nssn[IEEE80211_NUM_TIDS];
+ 	/* Last BAR start sequence sent per TID, 0x8000 set when valid */
+ 	u16 ampdu_bar_ssn[IEEE80211_NUM_TIDS];
++	/* Newest sequence number handed to the hardware per TID, 0x8000 set
++	 * when valid; see b43_bar_is_stale()
++	 */
++	u16 ampdu_tx_sn[IEEE80211_NUM_TIDS];
+ 	/* A-MPDU length limit per bandwidth (20/40 MHz) and MCS after TX
+ 	 * FIFO underflows, 0 = none; see dma_ampdu_underflow()
+ 	 */
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 29f24af64cad..f4e06fb931a8 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -3962,6 +3962,46 @@ static int b43_rng_init(struct b43_wl *wl)
+ 	return err;
+ }
+ 
++/* TID and sequence number of a QoS data frame for wl->ampdu_tx_sn,
++ * read before the frame is handed over; -1 for anything else
++ */
++static int b43_tx_tid_sn(struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++
++	if (!ieee80211_is_data_qos(hdr->frame_control))
++		return -1;
++	return ieee80211_get_tid(hdr) << 12 | le16_to_cpu(hdr->seq_ctrl) >> 4;
++}
++
++/* mac80211 queues a BAR behind the data in the TID's TXQ; under load it
++ * reached us up to 0.7 s and 1300 MPDUs after it was sent. Once the
++ * recipient's window is more than 2048 past its start sequence number, the
++ * BAR reads as one far ahead: the recipient moves its window there and
++ * drops everything we send as old until our sequence numbers catch up,
++ * which with TCP stalled took 10-17 minutes. A BAR that far behind has no
++ * holes left to skip, so drop it; well before that, at 1024.
++ */
++static bool b43_bar_is_stale(struct b43_wl *wl, struct sk_buff *skb)
++{
++	struct ieee80211_bar *bar = (struct ieee80211_bar *)skb->data;
++	u16 ctl, sn;
++	u8 tid;
++
++	if (!ieee80211_is_back_req(bar->frame_control))
++		return false;
++	ctl = le16_to_cpu(bar->control);
++	if (ctl & IEEE80211_BAR_CTRL_MULTI_TID)
++		return false;
++	tid = (ctl & IEEE80211_BAR_CTRL_TID_INFO_MASK) >>
++	      IEEE80211_BAR_CTRL_TID_INFO_SHIFT;
++	sn = wl->ampdu_tx_sn[tid];
++	if (!(sn & 0x8000))
++		return false;
++	return ((sn + 1 - (le16_to_cpu(bar->start_seq_num) >> 4)) & 0xFFF) >=
++	       0x400;
++}
++
+ static bool b43_ampdu_candidate(struct b43_wldev *dev, struct sk_buff *skb)
+ {
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+@@ -3989,6 +4029,7 @@ static int b43_tx_ampdu(struct b43_wldev *dev, int queue_num,
+ 			struct sk_buff *skb)
+ {
+ 	static const u8 spacing_qus[8] = { 0, 1, 2, 4, 8, 16, 32, 64 };
++	u16 tail_sn;
+ 	struct b43_wl *wl = dev->wl;
+ 	struct sk_buff_head *q = &wl->tx_queue[queue_num];
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+@@ -4094,9 +4135,12 @@ static int b43_tx_ampdu(struct b43_wldev *dev, int queue_num,
+ 	ndelim[n - 1] = 0;
+ 
+ 	ssn = le16_to_cpu(hdr->seq_ctrl) >> 4;
++	tail_sn = le16_to_cpu(((struct ieee80211_hdr *)skb->data)->seq_ctrl);
+ 	err = b43_dma_tx_ampdu(dev, &agg, ndelim, total);
+-	if (!err)
++	if (!err) {
+ 		wl->ampdu_ssn[tid][wl->ampdu_nssn[tid]++] = ssn;
++		wl->ampdu_tx_sn[tid] = (tail_sn >> 4) | 0x8000;
++	}
+ 	if (err) {
+ 		unsigned long flags;
+ 
+@@ -4142,6 +4186,7 @@ static void b43_tx_work(struct work_struct *work)
+ 	struct b43_wldev *dev;
+ 	struct sk_buff *skb;
+ 	int queue_num;
++	int tid_sn;
+ 	int err = 0;
+ 
+ 	mutex_lock(&wl->mutex);
+@@ -4193,6 +4238,20 @@ static void b43_tx_work(struct work_struct *work)
+ 				}
+ 				continue;
+ 			}
++			if (unlikely(b43_bar_is_stale(wl, skb))) {
++				struct ieee80211_tx_info *info =
++					IEEE80211_SKB_CB(skb);
++
++				/* Not sent; report it acked all the same, or
++				 * mac80211 resends it on the next ACK
++				 */
++				b43dbg(wl, "Dropping a stale BAR\n");
++				ieee80211_tx_info_clear_status(info);
++				info->flags |= IEEE80211_TX_STAT_ACK;
++				b43_tx_status_handoff(dev, skb);
++				continue;
++			}
++			tid_sn = b43_tx_tid_sn(skb);
+ 			b43_tx_follow_pm(dev, skb);
+ 			if (b43_using_pio_transfers(dev))
+ 				err = b43_pio_tx(dev, skb);
+@@ -4211,6 +4270,9 @@ static void b43_tx_work(struct work_struct *work)
+ 			}
+ 			if (unlikely(err))
+ 				ieee80211_free_txskb(wl->hw, skb);
++			else if (tid_sn >= 0)
++				wl->ampdu_tx_sn[tid_sn >> 12] =
++					(tid_sn & 0xFFF) | 0x8000;
+ 			err = 0;
+ 		}
+ 
+@@ -6021,6 +6083,7 @@ static int b43_op_ampdu_action(struct ieee80211_hw *hw,
+ 		mutex_lock(&wl->mutex);
+ 		wl->ampdu_nssn[params->tid] = 0;
+ 		wl->ampdu_bar_ssn[params->tid] = 0;
++		wl->ampdu_tx_sn[params->tid] = 0;
+ 		wl->ampdu_max_len = (1 << (IEEE80211_HT_MAX_AMPDU_FACTOR +
+ 					   sta->deflink.ht_cap.ampdu_factor)) - 1;
+ 		wl->ampdu_density = sta->deflink.ht_cap.ampdu_density;

@@ -127,6 +127,8 @@ the table below before the patch is sent.
 | 15 | deliver RX and TX status through NAPI for BCM4331 HT | not upstream on its own (shared BE from patch 11); opt-in `htphy_napi` | TCP RX 199-206 -> 233-237 Mbps (wl 207-212); GRO flush timeout A/B/A 237/199/236; 30 min RX 235 / TX 169; reconnect, restart, s2idle, S3, QoS/SSH, forced backpressure pass. PIO/qos4331 excluded | | |
 | 16 | stop aggregating a TID once its TX BA session is torn down | not upstream on its own (A-MPDU TX from patch 8) | BA stop/start via agg_status debugfs up to 1000x at 10 ms under TCP TX: no stall/warning, throughput recovers at once | | |
 | 17 | implement the flush operation | candidate for batch 2 (generic, but measured only with the full series) | Full scan under TCP TX, 4 runs each: 17.1 -> 13.7 s, 49-68 -> 88-94 Mbps, zero-progress seconds 5 -> 0; 1 of 6 later runs still stalled ~5 s at scan end | | |
+| 18 | drop BARs that went stale on the way to the hardware | not upstream on its own (A-MPDU TX from patch 8) | BARs reached the driver up to 0.7 s / 2566 MPDUs late; past 2048 the AP moved its window ahead and dropped all traffic for 10-17 min (3 of 3 outages followed such a BAR; tearing down the BA session cured it at once). 6 h soak with patch 19: 0 outages, 18 BARs dropped | | |
+| 19 | keep one A-MPDU in flight per ring | not upstream on its own (A-MPDU TX from patch 8) | TCP TX 162-165 -> 187-190 Mbps, retransmissions ~20 -> 0 per 20 s; UDP TX 213 -> 189-195. 6 h soak: TCP TX 145-183, RX 193-226, bidir 80/80, SSH 379/380, scans 69/69 | | |
 
 b43 is orphaned (MAINTAINERS: `S: Orphan`); patches go to
 linux-wireless@vger.kernel.org and b43-dev@lists.infradead.org and are

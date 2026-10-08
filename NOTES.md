@@ -900,6 +900,43 @@ swapped in later. Patch 18 is withdrawn (kept on a local branch); the
 series is back to patches 1-17, which passed 3 hours. Next time: arm
 netconsole and a hardlockup panic before testing this again.
 
+## Round 25: the outages behind patch 18/19
+
+Retested one A-MPDU in flight (now patch 19) with Turbo Boost off,
+netconsole to the workstation and panic on oops/lockups, booted as a
+one-shot entry. No hang or power loss in 4 + 6 + 8 hours: the generation 30
+power-off was most likely thermal (round 24 temperatures).
+
+What remained: every few hours Wi-Fi lost all traffic for 10-17 minutes
+and then recovered by itself. During an outage the station pinged nothing,
+yet frames went out, the BE ring advanced and nothing was stopped; tearing
+down the TX BA session of TID 0 (mac80211 `agg_status`) cured it within
+10 s, three times out of three.
+
+Logging every BAR found the cause. mac80211 queues a BAR in the TID's TXQ
+behind the data there; under TCP TX BARs reached the driver up to 0.7 s and
+2566 MPDUs after they were sent. Once the recipient's window is more than
+2048 past a BAR's start, the BAR reads as one far ahead: the AP moves its
+window there and drops everything older, i.e. everything we send, until our
+sequence numbers catch up, which at stalled-TCP rates takes minutes. Each
+logged outage began within seconds of such a BAR. One aggregate in flight
+keeps more frames waiting, so it made this more likely; patches 1-17 have
+the same exposure.
+
+Patch 18 tracks the newest sequence number handed to the hardware per TID
+and drops a BAR 1024 or more behind it (reporting it acked, or mac80211
+resends it on the next ACK). Six-hour soak with patches 1-19: no outage,
+18 BARs dropped, SSH 379/380 (one timeout during a scan), scans 69/69.
+TCP TX per 10-minute block 145-183 Mbit/s (it drifted down for a few hours
+overnight and back), TCP RX 193-226, paced bidirectional 80/80.
+
+Short runs, same hour, Turbo Boost off: TCP TX 187-190 (patches 1-17:
+162-165), TCP RX 230-232, UDP TX 189-195 (213), UDP RX 248-250.
+
+A debug build crashed on association (a NULL dereference in my own logging,
+reading the aggregate list after DMA had taken the frames); netconsole
+caught the oops, panic_on_oops rebooted into the default entry.
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 13:10:46 +1100
-Subject: [PATCH wireless-next 07/17] wifi: b43: HT-PHY: fix saving and
+Subject: [PATCH wireless-next 07/19] wifi: b43: HT-PHY: fix saving and
  restoring the TX power control index
 
 When TX power control is disabled, its current gain index is saved so
