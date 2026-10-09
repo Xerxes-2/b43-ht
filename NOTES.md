@@ -939,6 +939,11 @@ A debug build crashed on association (a NULL dereference in my own logging,
 reading the aggregate list after DMA had taken the frames); netconsole
 caught the oops, panic_on_oops rebooted into the default entry.
 
+wl retested under the same conditions (generation 43 wl entry, Turbo
+Boost off, MRRS 512, same AP and day): UDP TX 192-199, TCP TX 162-163,
+UDP RX 234-235, TCP RX 191-192 (193 over 120 s). wl's TCP RX lost ~15
+Mbit/s without Turbo Boost (207-212 before); b43-ht with NAPI/GRO lost ~1%.
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl
