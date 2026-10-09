@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Fri, 9 Oct 2026 15:35:28 +1100
+Subject: [PATCH wireless-next 09/21] wifi: b43: set the PM bit of nullfunc
+ frames through MACCTL_HWPS
+
+Before leaving the operating channel for a software scan, mac80211
+sends a nullfunc frame with the PM bit set, so that the AP buffers our
+frames until a nullfunc with PM clear announces we are back. The b43
+microcode, however, writes the PM bit of every frame it transmits from
+the hardware power save bit in MACCTL, which b43 never sets. The
+frame goes out with PM clear (seen in an air capture), the AP keeps
+transmitting while we are on other channels, and those frames are
+lost after the AP's retries.
+
+When a nullfunc frame is handed to the hardware, set or clear
+MACCTL_HWPS to match its PM bit, and clear it when the scan completes.
+The device stays awake; only the PM bit of transmitted frames changes.
+
+Tested on a BCM4331 at 2.4 GHz, pinging its address from a wired host
+every 100 ms for 8 s while it ran a full scan, four runs per module,
+alternating twice between modules. Before: 29-61 of 80 replies, gaps
+up to 1.8 s. After: 70-77 of 80, gaps up to 300 ms.
+
+Assisted-by: pi:claude-opus-5-5
+---
+ drivers/net/wireless/broadcom/b43/main.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index b2876eb84dad..0cccd3bf864f 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -3589,6 +3589,26 @@ static int b43_rng_init(struct b43_wl *wl)
+ 	return err;
+ }
+ 
++/* The microcode sets the power management bit of every frame it sends
++ * from the hardware power save bit in MACCTL, not from the frame. So the
++ * nullfunc frame mac80211 sends before leaving the channel for a software
++ * scan went out with PM clear, and the AP kept transmitting to us while
++ * we were away. Follow the PM bit of the nullfunc frames; the device
++ * stays awake either way.
++ */
++static void b43_tx_follow_pm(struct b43_wldev *dev, struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++
++	if (!ieee80211_is_nullfunc(hdr->frame_control) &&
++	    !ieee80211_is_qos_nullfunc(hdr->frame_control))
++		return;
++	if (ieee80211_has_pm(hdr->frame_control))
++		b43_maskset32(dev, B43_MMIO_MACCTL, ~0, B43_MACCTL_HWPS);
++	else
++		b43_maskset32(dev, B43_MMIO_MACCTL, ~B43_MACCTL_HWPS, 0);
++}
++
+ static void b43_tx_work(struct work_struct *work)
+ {
+ 	struct b43_wl *wl = container_of(work, struct b43_wl, tx_work);
+@@ -3607,6 +3627,7 @@ static void b43_tx_work(struct work_struct *work)
+ 	for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
+ 		while (skb_queue_len(&wl->tx_queue[queue_num])) {
+ 			skb = skb_dequeue(&wl->tx_queue[queue_num]);
++			b43_tx_follow_pm(dev, skb);
+ 			if (b43_using_pio_transfers(dev))
+ 				err = b43_pio_tx(dev, skb);
+ 			else
+@@ -5170,6 +5191,8 @@ static void b43_op_sw_scan_complete_notifier(struct ieee80211_hw *hw,
+ 	if (dev && (b43_status(dev) >= B43_STAT_INITIALIZED)) {
+ 		/* Re-enable CFP update. */
+ 		b43_hf_write(dev, b43_hf_read(dev) & ~B43_HF_SKCFPUP);
++		/* Back on the channel: frames go out with PM clear again */
++		b43_maskset32(dev, B43_MMIO_MACCTL, ~B43_MACCTL_HWPS, 0);
+ 	}
+ 	mutex_unlock(&wl->mutex);
+ }

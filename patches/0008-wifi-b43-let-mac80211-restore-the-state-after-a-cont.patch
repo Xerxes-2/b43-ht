@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shupeng Xue <dspxue@gmail.com>
+Date: Fri, 9 Oct 2026 14:45:56 +1100
+Subject: [PATCH wireless-next 08/21] wifi: b43: let mac80211 restore the state
+ after a controller restart
+
+b43_chip_reset() re-initialises the core and then reloads the channel
+configuration and the BSS info, but not the keys: the init clears the
+key memory and dev->key[], and nothing puts the keys back. With
+hardware crypto, b43_generate_txhdr() then fails every encrypted frame
+with -ENOKEY. The interface stays associated but no data gets through
+until the connection is torn down and set up again by hand.
+
+Drivers that lose their state on a reset ask mac80211 to replay it
+with ieee80211_restart_hw(). Do that when the core was running: take
+it down as before, mark the interface removed (mac80211 adds it
+again), and let b43_op_start() bring the core up. The configuration
+and BSS reloads become unnecessary there. A core that was only
+initialised is re-initialised as before.
+
+Tested on a BCM4331 at 2.4 GHz with WPA2 and the default hardware
+crypto, restarting the controller three times through debugfs while
+pinging the AP once a second. Before: still associated, but no echo
+reply in the 30 s after any of the restarts. After: replies from the
+first or second ping on, 26-28 of 30 answered.
+
+Fixes: e4d6b7951812 ("[B43]: add mac80211-based driver for modern BCM43xx devices")
+Assisted-by: pi:claude-opus-5-5
+---
+ drivers/net/wireless/broadcom/b43/main.c | 29 +++++++++++++-----------
+ 1 file changed, 16 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
+index 3eabe7b41add..b2876eb84dad 100644
+--- a/drivers/net/wireless/broadcom/b43/main.c
++++ b/drivers/net/wireless/broadcom/b43/main.c
+@@ -5244,19 +5244,24 @@ static void b43_chip_reset(struct work_struct *work)
+ 	if (prev_status >= B43_STAT_INITIALIZED)
+ 		b43_wireless_core_exit(dev);
+ 
+-	/* ...and up again. */
+-	if (prev_status >= B43_STAT_INITIALIZED) {
+-		err = b43_wireless_core_init(dev);
+-		if (err)
+-			goto out;
+-	}
++	/* Running: let mac80211 start us again and replay the whole
++	 * configuration. Reloading only the config and BSS info here left
++	 * the key memory, which the init clears, empty, so with hardware
++	 * crypto every frame was dropped for want of its key. mac80211 adds
++	 * the interface again, so it must look removed.
++	 */
+ 	if (prev_status >= B43_STAT_STARTED) {
+-		err = b43_wireless_core_start(dev);
+-		if (err) {
+-			b43_wireless_core_exit(dev);
+-			goto out;
+-		}
++		wl->operating = false;
++		wl->vif = NULL;
++		mutex_unlock(&wl->mutex);
++		ieee80211_restart_hw(wl->hw);
++		b43info(wl, "Controller restart handed to mac80211\n");
++		return;
+ 	}
++
++	/* ...and up again. */
++	if (prev_status >= B43_STAT_INITIALIZED)
++		err = b43_wireless_core_init(dev);
+ out:
+ 	if (err)
+ 		wl->current_dev = NULL; /* Failed to init the dev. */
+@@ -5269,8 +5274,6 @@ static void b43_chip_reset(struct work_struct *work)
+ 
+ 	/* reload configuration */
+ 	b43_op_config(wl->hw, -1, ~0);
+-	if (wl->vif)
+-		b43_op_bss_info_changed(wl->hw, wl->vif, &wl->vif->bss_conf, ~0);
+ 
+ 	b43info(wl, "Controller restarted\n");
+ }

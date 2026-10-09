@@ -15,7 +15,7 @@ TX/RX relative to the card, 20-second runs):
 
 | | UDP TX | TCP TX | UDP RX | TCP RX |
 |---|---|---|---|---|
-| b43-ht, patches 1–19, `htphy_napi=1` | 176–195 | **187–190** | **246–250** | **224–232** |
+| b43-ht, patches 1–21, `htphy_napi=1` | 176–195 | **187–190** | **246–250** | **224–232** |
 | wl | **192–199** | 162–163 | 234–235 | 191–193 |
 
 Both rows come from the same machine and AP on the same day; wl was booted
@@ -34,7 +34,7 @@ Where the numbers come from:
   a 125 µs GRO flush timeout. Without NAPI, TCP RX is 199–206; an A/B/A of
   the flush timeout alone gave 237 / 199 / 236.
 - **TCP TX** gains about 20 Mbit/s from keeping one A-MPDU in flight
-  instead of two (patch 19): retransmissions drop from ~20 to 0 per 20 s.
+  instead of two (patch 21): retransmissions drop from ~20 to 0 per 20 s.
   The cost is ~25 Mbit/s of saturated UDP TX, which is why that column
   trails wl.
 - **TX** depends on PCIe MRRS 512 (set by the driver). At the default 128,
@@ -42,13 +42,13 @@ Where the numbers come from:
 
 ### Stability
 
-A 6-hour soak of patches 1–19 (alternating 10-minute TCP RX / TCP TX /
+A 6-hour soak of patches 1–21 (alternating 10-minute TCP RX / TCP TX /
 paced bidirectional blocks, a scan every 5 minutes, SSH every minute) had
 no outage, disconnect, warning or controller restart: TCP RX 193–226,
 TCP TX 145–183, bidirectional 80/80 Mbit/s, SSH 379/380 (the one miss
 during a scan), scans 69/69. Earlier soaks had lost all traffic for
 10–17 minutes every few hours; that was a BAR delivered too late
-(patch 18, NOTES.md round 25). TX FIFO underflows and PHY errors still
+(patch 20, NOTES.md round 25). TX FIFO underflows and PHY errors still
 occur at a low rate.
 
 Also passed: cold boot, reconnects, a forced controller restart, s2idle
@@ -60,7 +60,7 @@ Latency under load (ping, 0.2 s interval): saturated TCP TX adds ~10 ms
 queue is in the AP's downlink, not in the station.
 
 A full scan during saturated TCP TX takes 13.7 s and keeps ~90 Mbit/s,
-thanks to the flush operation (patch 17). Without it: 17 s, ~55 Mbit/s
+thanks to the flush operation (patch 19). Without it: 17 s, ~55 Mbit/s
 and seconds without TCP progress. About one scan in six still stalls for
 ~5 s as it ends.
 
@@ -206,8 +206,8 @@ Then load it with `htphy_5ghz=2 htphy_11n=3 htphy_napi=1`.
 ## Repository
 
 - `patches/` holds the driver patch series, exported from a kernel tree
-  (`patches/series` gives the order and the base commit). Patches 1–7 are
-  self-contained fixes meant for upstream; patch 8 holds the 5 GHz/802.11n
+  (`patches/series` gives the order and the base commit). Patches 1–9 are
+  self-contained fixes meant for upstream; patch 10 holds the 5 GHz/802.11n
   work not yet split out, and the later ones build on it. See
   [DEVELOPMENT.md](DEVELOPMENT.md).
 - `nix/` holds the package and the NixOS module.

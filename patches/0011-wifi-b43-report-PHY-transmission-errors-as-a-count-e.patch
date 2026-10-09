@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 21:00:55 +1100
-Subject: [PATCH wireless-next 09/19] wifi: b43: report PHY transmission errors
+Subject: [PATCH wireless-next 11/21] wifi: b43: report PHY transmission errors
  as a count every 15 s
 
 Each B43_IRQ_PHY_TXERR logged "PHY transmission error" through the

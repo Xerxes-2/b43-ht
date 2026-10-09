@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shupeng Xue <dspxue@gmail.com>
 Date: Sun, 4 Oct 2026 13:12:31 +1100
-Subject: [PATCH wireless-next 08/19] b43: HT-PHY: 5 GHz, 802.11n and the rest
+Subject: [PATCH wireless-next 10/21] b43: HT-PHY: 5 GHz, 802.11n and the rest
  (not yet split, not for submission)
 
 Everything else from b43-ht: 5 GHz support (channel and gain tables,
@@ -15,7 +15,7 @@ Assisted-by: pi:claude-opus-5-5
  drivers/net/wireless/broadcom/b43/b43.h       |   18 +
  drivers/net/wireless/broadcom/b43/dma.c       |  273 ++++-
  drivers/net/wireless/broadcom/b43/dma.h       |   12 +
- drivers/net/wireless/broadcom/b43/main.c      |  505 +++++++-
+ drivers/net/wireless/broadcom/b43/main.c      |  509 +++++++-
  drivers/net/wireless/broadcom/b43/main.h      |    1 +
  .../net/wireless/broadcom/b43/phy_common.c    |   12 +-
  .../net/wireless/broadcom/b43/phy_common.h    |    9 +
@@ -26,7 +26,7 @@ Assisted-by: pi:claude-opus-5-5
  .../net/wireless/broadcom/b43/tables_phy_ht.h |    1 +
  drivers/net/wireless/broadcom/b43/xmit.c      |  293 ++++-
  drivers/net/wireless/broadcom/b43/xmit.h      |   19 +
- 14 files changed, 2293 insertions(+), 78 deletions(-)
+ 14 files changed, 2282 insertions(+), 93 deletions(-)
 
 diff --git a/drivers/net/wireless/broadcom/b43/b43.h b/drivers/net/wireless/broadcom/b43/b43.h
 index c0d8fc0b22fb..1827af9cae02 100644
@@ -430,7 +430,7 @@ index f9f65bbe2d76..618c76e0ac6e 100644
  			     const struct b43_txstatus *status);
  
 diff --git a/drivers/net/wireless/broadcom/b43/main.c b/drivers/net/wireless/broadcom/b43/main.c
-index 3eabe7b41add..9d39f877303a 100644
+index 0cccd3bf864f..9d39f877303a 100644
 --- a/drivers/net/wireless/broadcom/b43/main.c
 +++ b/drivers/net/wireless/broadcom/b43/main.c
 @@ -38,6 +38,7 @@
@@ -633,10 +633,16 @@ index 3eabe7b41add..9d39f877303a 100644
  		wl->hw->queues = 1;
  
  	err = ieee80211_register_hw(wl->hw);
-@@ -3589,6 +3708,164 @@ static int b43_rng_init(struct b43_wl *wl)
+@@ -3589,24 +3708,162 @@ static int b43_rng_init(struct b43_wl *wl)
  	return err;
  }
  
+-/* The microcode sets the power management bit of every frame it sends
+- * from the hardware power save bit in MACCTL, not from the frame. So the
+- * nullfunc frame mac80211 sends before leaving the channel for a software
+- * scan went out with PM clear, and the AP kept transmitting to us while
+- * we were away. Follow the PM bit of the nullfunc frames; the device
+- * stays awake either way.
 +static bool b43_ampdu_candidate(struct b43_wldev *dev, struct sk_buff *skb)
 +{
 +	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
@@ -778,27 +784,27 @@ index 3eabe7b41add..9d39f877303a 100644
 + * away and lost those frames: a background scan cost several seconds of
 + * traffic. Follow the PM bit of the nullfunc frames mac80211 sends; we
 + * stay awake either way.
-+ */
-+static void b43_tx_follow_pm(struct b43_wldev *dev, struct sk_buff *skb)
-+{
-+	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
+  */
+ static void b43_tx_follow_pm(struct b43_wldev *dev, struct sk_buff *skb)
+ {
+ 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
 +	u32 macctl;
-+
-+	if (!ieee80211_is_nullfunc(hdr->frame_control) &&
-+	    !ieee80211_is_qos_nullfunc(hdr->frame_control))
-+		return;
+ 
+ 	if (!ieee80211_is_nullfunc(hdr->frame_control) &&
+ 	    !ieee80211_is_qos_nullfunc(hdr->frame_control))
+ 		return;
 +	macctl = b43_read32(dev, B43_MMIO_MACCTL);
-+	if (ieee80211_has_pm(hdr->frame_control))
+ 	if (ieee80211_has_pm(hdr->frame_control))
+-		b43_maskset32(dev, B43_MMIO_MACCTL, ~0, B43_MACCTL_HWPS);
 +		macctl |= B43_MACCTL_HWPS;
-+	else
+ 	else
+-		b43_maskset32(dev, B43_MMIO_MACCTL, ~B43_MACCTL_HWPS, 0);
 +		macctl &= ~B43_MACCTL_HWPS;
 +	b43_write32(dev, B43_MMIO_MACCTL, macctl);
-+}
-+
+ }
+ 
  static void b43_tx_work(struct work_struct *work)
- {
- 	struct b43_wl *wl = container_of(work, struct b43_wl, tx_work);
-@@ -3607,6 +3884,26 @@ static void b43_tx_work(struct work_struct *work)
+@@ -3627,6 +3884,25 @@ static void b43_tx_work(struct work_struct *work)
  	for (queue_num = 0; queue_num < B43_QOS_QUEUE_NUM; queue_num++) {
  		while (skb_queue_len(&wl->tx_queue[queue_num])) {
  			skb = skb_dequeue(&wl->tx_queue[queue_num]);
@@ -821,11 +827,10 @@ index 3eabe7b41add..9d39f877303a 100644
 +				}
 +				continue;
 +			}
-+			b43_tx_follow_pm(dev, skb);
+ 			b43_tx_follow_pm(dev, skb);
  			if (b43_using_pio_transfers(dev))
  				err = b43_pio_tx(dev, skb);
- 			else
-@@ -3646,8 +3943,20 @@ static void b43_op_tx(struct ieee80211_hw *hw,
+@@ -3667,8 +3943,20 @@ static void b43_op_tx(struct ieee80211_hw *hw,
  	}
  	B43_WARN_ON(skb_shinfo(skb)->nr_frags);
  
@@ -846,7 +851,7 @@ index 3eabe7b41add..9d39f877303a 100644
  	if (!wl->tx_queue_stopped[skb_queue_mapping])
  		ieee80211_queue_work(wl->hw, &wl->tx_work);
  	else
-@@ -3892,9 +4201,15 @@ static const char *band_to_string(enum nl80211_band band)
+@@ -3913,9 +4201,15 @@ static const char *band_to_string(enum nl80211_band band)
  
  /* Expects wl->mutex locked */
  static int b43_switch_band(struct b43_wldev *dev,
@@ -863,7 +868,7 @@ index 3eabe7b41add..9d39f877303a 100644
  	bool gmode;
  	u32 tmp;
  
-@@ -3917,19 +4232,20 @@ static int b43_switch_band(struct b43_wldev *dev,
+@@ -3938,19 +4232,20 @@ static int b43_switch_band(struct b43_wldev *dev,
  		return -ENODEV;
  	}
  
@@ -887,7 +892,7 @@ index 3eabe7b41add..9d39f877303a 100644
  	b43_phy_put_into_reset(dev);
  	switch (dev->dev->bus_type) {
  #ifdef CONFIG_B43_BCMA
-@@ -3939,6 +4255,11 @@ static int b43_switch_band(struct b43_wldev *dev,
+@@ -3960,6 +4255,11 @@ static int b43_switch_band(struct b43_wldev *dev,
  			tmp |= B43_BCMA_IOCTL_GMODE;
  		else
  			tmp &= ~B43_BCMA_IOCTL_GMODE;
@@ -899,7 +904,7 @@ index 3eabe7b41add..9d39f877303a 100644
  		bcma_awrite32(dev->dev->bdev, BCMA_IOCTL, tmp);
  		break;
  #endif
-@@ -3959,6 +4280,13 @@ static int b43_switch_band(struct b43_wldev *dev,
+@@ -3980,6 +4280,13 @@ static int b43_switch_band(struct b43_wldev *dev,
  
  	b43_phy_init(dev);
  
@@ -913,7 +918,7 @@ index 3eabe7b41add..9d39f877303a 100644
  	return 0;
  }
  
-@@ -4002,9 +4330,12 @@ static int b43_op_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
+@@ -4023,9 +4330,12 @@ static int b43_op_config(struct ieee80211_hw *hw, int radio_idx, u32 changed)
  	if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
  		phy->chandef = &conf->chandef;
  		phy->channel = conf->chandef.chan->hw_value;
@@ -928,7 +933,7 @@ index 3eabe7b41add..9d39f877303a 100644
  		if (err)
  			goto out_mac_enable;
  
-@@ -4160,6 +4491,13 @@ static void b43_op_bss_info_changed(struct ieee80211_hw *hw,
+@@ -4181,6 +4491,13 @@ static void b43_op_bss_info_changed(struct ieee80211_hw *hw,
  			b43_short_slot_timing_disable(dev);
  	}
  
@@ -942,7 +947,7 @@ index 3eabe7b41add..9d39f877303a 100644
  	b43_mac_enable(dev);
  out_unlock_mutex:
  	mutex_unlock(&wl->mutex);
-@@ -4877,6 +5215,15 @@ static int b43_wireless_core_init(struct b43_wldev *dev)
+@@ -4898,6 +5215,15 @@ static int b43_wireless_core_init(struct b43_wldev *dev)
  		goto err_busdown;
  	b43_shm_write16(dev, B43_SHM_SHARED,
  			B43_SHM_SH_WLCOREREV, dev->dev->core_rev);
@@ -958,7 +963,7 @@ index 3eabe7b41add..9d39f877303a 100644
  	hf = b43_hf_read(dev);
  	if (phy->type == B43_PHYTYPE_G) {
  		hf |= B43_HF_SYMW;
-@@ -5151,6 +5498,7 @@ static void b43_op_sw_scan_start_notifier(struct ieee80211_hw *hw,
+@@ -5172,6 +5498,7 @@ static void b43_op_sw_scan_start_notifier(struct ieee80211_hw *hw,
  	struct b43_wldev *dev;
  
  	mutex_lock(&wl->mutex);
@@ -966,7 +971,7 @@ index 3eabe7b41add..9d39f877303a 100644
  	dev = wl->current_dev;
  	if (dev && (b43_status(dev) >= B43_STAT_INITIALIZED)) {
  		/* Disable CFP update during scan on other channels. */
-@@ -5166,10 +5514,43 @@ static void b43_op_sw_scan_complete_notifier(struct ieee80211_hw *hw,
+@@ -5187,12 +5514,43 @@ static void b43_op_sw_scan_complete_notifier(struct ieee80211_hw *hw,
  	struct b43_wldev *dev;
  
  	mutex_lock(&wl->mutex);
@@ -975,8 +980,9 @@ index 3eabe7b41add..9d39f877303a 100644
  	if (dev && (b43_status(dev) >= B43_STAT_INITIALIZED)) {
  		/* Re-enable CFP update. */
  		b43_hf_write(dev, b43_hf_read(dev) & ~B43_HF_SKCFPUP);
+-		/* Back on the channel: frames go out with PM clear again */
 +		/* Back for good: frames go out with PM clear again */
-+		b43_maskset32(dev, B43_MMIO_MACCTL, ~B43_MACCTL_HWPS, 0);
+ 		b43_maskset32(dev, B43_MMIO_MACCTL, ~B43_MACCTL_HWPS, 0);
 +		/* Calibrations skipped while scanning */
 +		if (dev->phy.type == B43_PHYTYPE_HT) {
 +			b43_mac_suspend(dev);
@@ -1010,7 +1016,7 @@ index 3eabe7b41add..9d39f877303a 100644
  	}
  	mutex_unlock(&wl->mutex);
  }
-@@ -5191,6 +5572,45 @@ static int b43_op_get_survey(struct ieee80211_hw *hw, int idx,
+@@ -5214,6 +5572,45 @@ static int b43_op_get_survey(struct ieee80211_hw *hw, int idx,
  	return 0;
  }
  
@@ -1056,7 +1062,7 @@ index 3eabe7b41add..9d39f877303a 100644
  static const struct ieee80211_ops b43_hw_ops = {
  	.add_chanctx = ieee80211_emulate_add_chanctx,
  	.remove_chanctx = ieee80211_emulate_remove_chanctx,
-@@ -5217,6 +5637,8 @@ static const struct ieee80211_ops b43_hw_ops = {
+@@ -5240,6 +5637,8 @@ static const struct ieee80211_ops b43_hw_ops = {
  	.sw_scan_complete	= b43_op_sw_scan_complete_notifier,
  	.get_survey		= b43_op_get_survey,
  	.rfkill_poll		= b43_rfkill_poll,
@@ -1065,32 +1071,60 @@ index 3eabe7b41add..9d39f877303a 100644
  };
  
  /* Hard-reset the chip. Do not call this directly.
-@@ -5244,6 +5666,24 @@ static void b43_chip_reset(struct work_struct *work)
+@@ -5267,15 +5666,18 @@ static void b43_chip_reset(struct work_struct *work)
  	if (prev_status >= B43_STAT_INITIALIZED)
  		b43_wireless_core_exit(dev);
  
+-	/* Running: let mac80211 start us again and replay the whole
+-	 * configuration. Reloading only the config and BSS info here left
+-	 * the key memory, which the init clears, empty, so with hardware
+-	 * crypto every frame was dropped for want of its key. mac80211 adds
+-	 * the interface again, so it must look removed.
 +	/* Running: let mac80211 bring us up again and replay the whole
 +	 * configuration. Re-initialising here and reloading only the config
 +	 * and BSS info left the key memory, which the init clears, empty:
 +	 * with WPA every frame was then dropped for want of its key
 +	 * (-ENOKEY), so the link never came back. mac80211 adds the
 +	 * interface again, so it must look removed.
-+	 */
-+	if (prev_status >= B43_STAT_STARTED) {
-+		wl->operating = false;
-+		wl->vif = NULL;
+ 	 */
+ 	if (prev_status >= B43_STAT_STARTED) {
+ 		wl->operating = false;
+ 		wl->vif = NULL;
 +		memset(wl->ampdu_buf, 0, sizeof(wl->ampdu_buf));
 +		memset(wl->ampdu_nssn, 0, sizeof(wl->ampdu_nssn));
-+		mutex_unlock(&wl->mutex);
-+		ieee80211_restart_hw(wl->hw);
-+		b43info(wl, "Controller restart handed to mac80211\n");
-+		return;
-+	}
-+
+ 		mutex_unlock(&wl->mutex);
+ 		ieee80211_restart_hw(wl->hw);
+ 		b43info(wl, "Controller restart handed to mac80211\n");
+@@ -5283,8 +5685,18 @@ static void b43_chip_reset(struct work_struct *work)
+ 	}
+ 
  	/* ...and up again. */
- 	if (prev_status >= B43_STAT_INITIALIZED) {
+-	if (prev_status >= B43_STAT_INITIALIZED)
++	if (prev_status >= B43_STAT_INITIALIZED) {
  		err = b43_wireless_core_init(dev);
-@@ -5292,7 +5732,37 @@ static int b43_setup_bands(struct b43_wldev *dev,
++		if (err)
++			goto out;
++	}
++	if (prev_status >= B43_STAT_STARTED) {
++		err = b43_wireless_core_start(dev);
++		if (err) {
++			b43_wireless_core_exit(dev);
++			goto out;
++		}
++	}
+ out:
+ 	if (err)
+ 		wl->current_dev = NULL; /* Failed to init the dev. */
+@@ -5297,6 +5709,8 @@ static void b43_chip_reset(struct work_struct *work)
+ 
+ 	/* reload configuration */
+ 	b43_op_config(wl->hw, -1, ~0);
++	if (wl->vif)
++		b43_op_bss_info_changed(wl->hw, wl->vif, &wl->vif->bss_conf, ~0);
+ 
+ 	b43info(wl, "Controller restarted\n");
+ }
+@@ -5318,7 +5732,37 @@ static int b43_setup_bands(struct b43_wldev *dev,
  	if (have_2ghz_phy)
  		hw->wiphy->bands[NL80211_BAND_2GHZ] = limited_2g ?
  			&b43_band_2ghz_limited : &b43_band_2GHz;
@@ -1129,7 +1163,7 @@ index 3eabe7b41add..9d39f877303a 100644
  		if (have_5ghz_phy)
  			hw->wiphy->bands[NL80211_BAND_5GHZ] = limited_5g ?
  				&b43_band_5GHz_nphy_limited :
-@@ -5447,9 +5917,16 @@ static int b43_wireless_core_attach(struct b43_wldev *dev)
+@@ -5473,9 +5917,16 @@ static int b43_wireless_core_attach(struct b43_wldev *dev)
  	/* We don't support 5 GHz on some PHYs yet */
  	if (have_5ghz_phy) {
  		switch (dev->phy.type) {
@@ -1147,7 +1181,7 @@ index 3eabe7b41add..9d39f877303a 100644
  			b43warn(wl, "5 GHz band is unsupported on this PHY\n");
  			have_5ghz_phy = false;
  		}
-@@ -5599,6 +6076,8 @@ static struct b43_wl *b43_wireless_init(struct b43_bus_dev *dev)
+@@ -5625,6 +6076,8 @@ static struct b43_wl *b43_wireless_init(struct b43_bus_dev *dev)
  	ieee80211_hw_set(hw, RX_INCLUDES_FCS);
  	ieee80211_hw_set(hw, SIGNAL_DBM);
  	ieee80211_hw_set(hw, MFP_CAPABLE);

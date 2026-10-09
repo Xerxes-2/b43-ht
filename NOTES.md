@@ -944,6 +944,28 @@ Boost off, MRRS 512, same AP and day): UDP TX 192-199, TCP TX 162-163,
 UDP RX 234-235, TCP RX 191-192 (193 over 120 s). wl's TCP RX lost ~15
 Mbit/s without Turbo Boost (207-212 before); b43-ht with NAPI/GRO lost ~1%.
 
+### Round 26: upstream batch 2 split out
+
+Controller restart and scan PM fixes split out of the big patch as
+patches 8-9, on the upstream base, and each tested on stock 6.18.55 b43
+(2.4 GHz, BCM4331) with only that patch. The full series is unchanged in
+content (the big patch, now 10, absorbs the difference).
+
+- Restart: stock b43 stays associated but passes no data after a
+  debugfs restart (keys gone, every encrypted frame dropped with
+  -ENOKEY). A first test looked as if the fix also failed after a few
+  seconds: the replies were arriving, but on the Ethernet port (ARP flux,
+  same subnet on both interfaces). With arp_ignore=1/arp_announce=2 the
+  results are clean: 0/30 before, 26-28/30 after, three restarts each.
+- Scan PM: wired ping every 100 ms during a full scan, A/B/A/B:
+  29-61/80 before, 70-77/80 after. A UDP downlink test (2-10 Mbit/s)
+  showed a different problem in both: after some scans the AP delivers
+  nothing for 6-30 s and then a burst; 8/8 runs without the patch, 3/9
+  with it. Cause unknown (AP-side PS state or something on our side
+  after the scan); not addressed by either patch.
+- Slot time after band switch: dropped as an upstream candidate; stock
+  b43 never switches band on this card, so it can't be shown here.
+
 ## Next steps
 
 1. Calibration complete (TX IQ/LO, RX IQ on both bands, redone every 120 s). Optional: split into multiple partial calibrations like wl
